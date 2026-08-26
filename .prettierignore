@@ -1,0 +1,11 @@
+.agents/
+.references/
+dist/
+examples/jekyll/.jekyll-cache/
+examples/jekyll/_site/
+examples/jekyll/assets/vendor/
+examples/jekyll/Gemfile.lock
+node_modules/
+playwright-report/
+pnpm-lock.yaml
+test-results/

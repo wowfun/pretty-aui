@@ -1,0 +1,14 @@
+.local
+.agents/skills/
+.references/
+node_modules/
+.vite/
+coverage/
+playwright-report/
+test-results/
+examples/jekyll/_site/
+examples/jekyll/.jekyll-cache/
+examples/jekyll/assets/vendor/
+.bundle/
+vendor/bundle/
+*.log

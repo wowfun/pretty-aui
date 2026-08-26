@@ -1,0 +1,6 @@
+title: pretty-aui Jekyll example
+baseurl: ""
+destination: _site
+exclude:
+  - Gemfile
+  - Gemfile.lock

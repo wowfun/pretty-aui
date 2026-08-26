@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>pretty-aui production bundle fixture</title>
+  </head>
+  <body>
+    <div id="chat"></div>
+    <script type="module">
+      import { mountChat } from "/standalone/pretty-aui.js";
+
+      const connector = {
+        open() {
+          let incoming;
+          const readable = new ReadableStream({
+            start(controller) {
+              incoming = controller;
+            },
+          });
+          const writable = new WritableStream({
+            write(message) {
+              if (!message || typeof message !== "object") return;
+              if (message.method === "initialize") {
+                respond(message.id, {
+                  protocolVersion: 1,
+                  agentInfo: {
+                    name: "dist-fixture",
+                    title: "Production Fixture",
+                    version: "1.0.0",
+                  },
+                  agentCapabilities: {
+                    promptCapabilities: {},
+                    sessionCapabilities: {},
+                  },
+                });
+              } else if (message.method === "session/new") {
+                respond(message.id, {
+                  sessionId: "dist-session",
+                  modes: { currentModeId: "", availableModes: [] },
+                });
+              } else if (message.method === "session/prompt") {
+                incoming.enqueue({
+                  jsonrpc: "2.0",
+                  method: "session/update",
+                  params: {
+                    sessionId: "dist-session",
+                    update: {
+                      sessionUpdate: "agent_message_chunk",
+                      content: {
+                        type: "text",
+                        text: "Production bundle answered.",
+                      },
+                    },
+                  },
+                });
+                respond(message.id, { stopReason: "end_turn" });
+              }
+            },
+            close() {
+              incoming.close();
+            },
+            abort(error) {
+              incoming.error(error);
+            },
+          });
+          function respond(id, result) {
+            queueMicrotask(() =>
+              incoming.enqueue({ jsonrpc: "2.0", id, result }),
+            );
+          }
+          return { readable, writable };
+        },
+      };
+
+      const mounted = mountChat(document.querySelector("#chat"), {
+        connector,
+        session: { cwd: "/production-fixture" },
+      });
+      window.__DIST_CHAT__ = mounted;
+      mounted.ready.then(() => {
+        document.body.dataset.ready = "true";
+      });
+    </script>
+  </body>
+</html>

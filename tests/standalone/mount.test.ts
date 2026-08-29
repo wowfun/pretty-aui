@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { mountChat } from "../../src/standalone.js";
 import { createV1Harness } from "../helpers/agents.js";
+import { FakeChatController } from "../helpers/controller.js";
 
 describe("standalone mount", () => {
   it("refuses to reuse a host-owned shadow root", async () => {
@@ -15,8 +16,10 @@ describe("standalone mount", () => {
 
     expect(() =>
       mountChat(target, {
-        connector: harness.connector,
-        session: { cwd: "/standalone" },
+        options: {
+          connector: harness.connector,
+          session: { cwd: "/standalone" },
+        },
       }),
     ).toThrow(/shadow root/i);
     expect(shadow.textContent).toBe("host-owned");
@@ -29,22 +32,28 @@ describe("standalone mount", () => {
     const secondHarness = createV1Harness();
     const target = document.createElement("div");
     const first = mountChat(target, {
-      connector: firstHarness.connector,
-      session: { cwd: "/first" },
+      options: {
+        connector: firstHarness.connector,
+        session: { cwd: "/first" },
+      },
     });
     await first.ready;
 
     expect(() =>
       mountChat(target, {
-        connector: secondHarness.connector,
-        session: { cwd: "/duplicate" },
+        options: {
+          connector: secondHarness.connector,
+          session: { cwd: "/duplicate" },
+        },
       }),
     ).toThrow(/already mounted/i);
     await first.unmount();
 
     const second = mountChat(target, {
-      connector: secondHarness.connector,
-      session: { cwd: "/second" },
+      options: {
+        connector: secondHarness.connector,
+        session: { cwd: "/second" },
+      },
     });
     await second.ready;
     await waitFor(() =>
@@ -64,8 +73,10 @@ describe("standalone mount", () => {
     target.style.setProperty("--pretty-aui-color-background", "rgb(1 2 3)");
     document.body.append(target);
     const mounted = mountChat(target, {
-      connector: harness.connector,
-      session: { cwd: "/standalone" },
+      options: {
+        connector: harness.connector,
+        session: { cwd: "/standalone" },
+      },
       surface: "sidebar",
       colorScheme: "dark",
       labels: { composerPlaceholder: "Standalone prompt" },
@@ -87,6 +98,9 @@ describe("standalone mount", () => {
     expect(stylesheet).toMatch(/var\(\s*--pretty-aui-color-background\s*,/);
     expect(stylesheet).not.toMatch(/--pretty-aui-color-background\s*:/);
     expect(stylesheet).not.toMatch(/\bdvh\b/);
+    expect(stylesheet).toContain(
+      ".pretty-aui-standalone-root > .pretty-aui {\n  height: 100%;\n  min-height: 0;\n}",
+    );
     expect(target.style.getPropertyValue("--pretty-aui-color-background")).toBe(
       "rgb(1 2 3)",
     );
@@ -104,8 +118,10 @@ describe("standalone mount", () => {
     const target = document.createElement("div");
     document.body.append(target);
     const mounted = mountChat(target, {
-      connector: harness.connector,
-      session: { cwd: "/removed" },
+      options: {
+        connector: harness.connector,
+        session: { cwd: "/removed" },
+      },
     });
     await mounted.ready;
 
@@ -125,8 +141,10 @@ describe("standalone mount", () => {
     ancestor.append(target);
     document.body.append(ancestor);
     const mounted = mountChat(target, {
-      connector: harness.connector,
-      session: { cwd: "/scoped-observer" },
+      options: {
+        connector: harness.connector,
+        session: { cwd: "/scoped-observer" },
+      },
     });
     await mounted.ready;
 
@@ -147,8 +165,10 @@ describe("standalone mount", () => {
     const target = document.createElement("div");
     document.body.append(target);
     const mounted = mountChat(target, {
-      connector: harness.connector,
-      session: { cwd: "/shadow-focus" },
+      options: {
+        connector: harness.connector,
+        session: { cwd: "/shadow-focus" },
+      },
     });
     try {
       await mounted.ready;
@@ -189,8 +209,10 @@ describe("standalone mount", () => {
     const target = document.createElement("div");
     document.body.append(target);
     const mounted = mountChat(target, {
-      connector: harness.connector,
-      session: { cwd: "/destroy-failure" },
+      options: {
+        connector: harness.connector,
+        session: { cwd: "/destroy-failure" },
+      },
     });
     await mounted.ready;
     const destroy = mounted.controller.destroy.bind(mounted.controller);
@@ -219,8 +241,10 @@ describe("standalone mount", () => {
     ancestor.append(foreignHost);
     document.body.append(ancestor);
     const mounted = mountChat(target, {
-      connector: harness.connector,
-      session: { cwd: "/nested-shadow" },
+      options: {
+        connector: harness.connector,
+        session: { cwd: "/nested-shadow" },
+      },
     });
     try {
       await mounted.ready;
@@ -235,5 +259,75 @@ describe("standalone mount", () => {
       await mounted.unmount();
       await harness.close();
     }
+  });
+
+  it("borrows a controller without destroying it on explicit or automatic unmount", async () => {
+    const controller = new FakeChatController();
+    const firstTarget = document.createElement("div");
+    document.body.append(firstTarget);
+    const first = mountChat(firstTarget, { controller });
+    await first.ready;
+
+    await first.unmount();
+    expect(controller.destroyCalls).toBe(0);
+
+    const secondTarget = document.createElement("div");
+    document.body.append(secondTarget);
+    const second = mountChat(secondTarget, { controller });
+    await second.ready;
+    secondTarget.remove();
+
+    await waitFor(() =>
+      expect(secondTarget.shadowRoot?.childNodes).toHaveLength(0),
+    );
+    expect(controller.destroyCalls).toBe(0);
+    await second.unmount();
+    firstTarget.remove();
+  });
+
+  it("applies a CSP nonce and exposes bounded composer controls", async () => {
+    const controller = new FakeChatController();
+    const target = document.createElement("div");
+    document.body.append(target);
+    const mounted = mountChat(target, {
+      controller,
+      styleNonce: "test-nonce_123=",
+    });
+    await mounted.ready;
+    const textarea = await within(
+      target.shadowRoot as unknown as HTMLElement,
+    ).findByRole("combobox");
+
+    expect(target.shadowRoot?.querySelector("style")).toHaveAttribute(
+      "nonce",
+      "test-nonce_123=",
+    );
+    mounted.setDraft("host supplied draft", { focus: true });
+    expect(textarea).toHaveValue("host supplied draft");
+    expect(target.shadowRoot?.activeElement).toBe(textarea);
+    textarea.blur();
+    mounted.focusComposer();
+    expect(target.shadowRoot?.activeElement).toBe(textarea);
+    expect(() => mounted.setDraft("x".repeat(1_048_577))).toThrow(/draft/i);
+
+    await mounted.unmount();
+    expect(() => mounted.focusComposer()).toThrow(/unmounted/i);
+  });
+
+  it("rejects invalid standalone boundary options before touching the host", () => {
+    const controller = new FakeChatController();
+    const target = document.createElement("div");
+
+    expect(() =>
+      mountChat(target, { controller, styleNonce: "not a nonce!" }),
+    ).toThrow(/nonce/i);
+    expect(target.shadowRoot).toBeNull();
+    expect(() =>
+      mountChat(target, {
+        controller,
+        options: {} as never,
+      } as never),
+    ).toThrow(/exactly one/i);
+    expect(target.shadowRoot).toBeNull();
   });
 });

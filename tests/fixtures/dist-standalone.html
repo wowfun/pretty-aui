@@ -3,16 +3,38 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" href="data:," />
     <title>pretty-aui production bundle fixture</title>
+    <style nonce="pretty-aui-test">
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        overflow: hidden;
+      }
+      body {
+        display: grid;
+        place-items: center;
+      }
+      #chat {
+        width: 680px;
+        height: 520px;
+        min-width: 0;
+        min-height: 0;
+      }
+    </style>
   </head>
   <body>
     <div id="chat"></div>
-    <script type="module">
+    <script type="module" nonce="pretty-aui-test">
       import { mountChat } from "/standalone/pretty-aui.js";
 
       const connector = {
         open() {
           let incoming;
+          let promptCount = 0;
+          let sessionCount = 0;
           const readable = new ReadableStream({
             start(controller) {
               incoming = controller;
@@ -35,21 +57,30 @@
                   },
                 });
               } else if (message.method === "session/new") {
+                sessionCount += 1;
                 respond(message.id, {
-                  sessionId: "dist-session",
+                  sessionId: `dist-session-${sessionCount}`,
                   modes: { currentModeId: "", availableModes: [] },
                 });
               } else if (message.method === "session/prompt") {
+                promptCount += 1;
                 incoming.enqueue({
                   jsonrpc: "2.0",
                   method: "session/update",
                   params: {
-                    sessionId: "dist-session",
+                    sessionId: message.params.sessionId,
                     update: {
                       sessionUpdate: "agent_message_chunk",
                       content: {
                         type: "text",
-                        text: "Production bundle answered.",
+                        text: [
+                          `Production bundle answered ${promptCount}.`,
+                          ...Array.from(
+                            { length: 12 },
+                            (_, index) =>
+                              `Evidence ${promptCount}.${index + 1}: deterministic standalone transcript content.`,
+                          ),
+                        ].join("\n\n"),
                       },
                     },
                   },
@@ -74,8 +105,11 @@
       };
 
       const mounted = mountChat(document.querySelector("#chat"), {
-        connector,
-        session: { cwd: "/production-fixture" },
+        options: {
+          connector,
+          session: { cwd: "/production-fixture" },
+        },
+        styleNonce: "pretty-aui-test",
       });
       window.__DIST_CHAT__ = mounted;
       mounted.ready.then(() => {

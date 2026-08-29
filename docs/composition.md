@@ -30,6 +30,12 @@ compact, but the host still owns the sidebar shell. Both surfaces respond to
 their container width, not the browser viewport. `colorScheme` accepts `light`,
 `dark`, or `system`.
 
+The active session is the full transcript projection exposed to the macros.
+The session drawer also receives bounded summaries for every loaded session so
+running turns, pending interactions, and failures remain discoverable without
+rendering background transcripts. Draft and transcript scroll state are kept
+per loaded session. Selecting a session never interrupts work in another one.
+
 ## Tool activity renderer
 
 Tool activity is the only public rendering seam. The renderer receives one
@@ -57,6 +63,22 @@ expanded body. A settled reasoning row previews its first line. While the
 current reasoning block streams, the preview switches to its latest line and
 follows that line's trailing edge as tokens arrive. A custom tool renderer
 replaces only the expanded body; it cannot replace this disclosure behavior.
+
+Each context item actually submitted with a turn is shown after that turn's
+user message and before Agent output as a package-owned `Context injection`
+disclosure. The row starts collapsed and names the item without exposing its
+payload. Its bounded scroll body renders model-facing text literally, keeps
+resource identifiers inert, and never interprets context as Markdown, HTML, a
+link, or playable media. Repeated per-turn injection produces repeated rows.
+
+When a context-provider adapter is configured, the composer renders its current
+selection above the text input as package-owned chips. The leading add action
+asks the adapter to capture a new host context; each chip has an individually
+named remove action. Chips wrap inside a bounded scroll region on narrow or
+crowded surfaces. They describe only the next-turn selection: sending freezes
+that ordered selection, and later add or remove operations do not rewrite prior
+activities. Stable slots expose the selection as `composer-context` and each
+chip as `composer-context-item`; submitted activities remain `data-kind="context"`.
 
 An OpenCode task reported as a `think` tool is presented as a distinct Agent
 row when its normalized input contains `subagent_type` plus a task description
@@ -117,6 +139,7 @@ The root accepts these public custom properties:
   --pretty-aui-shadow-raised:
     0 4px 12px 0 rgb(0 0 0 / 2%), 0 2px 8px 0 rgb(0 0 0 / 4%);
   --pretty-aui-height: 680px;
+  --pretty-aui-min-height: 420px;
   --pretty-aui-content-max-width: 748px;
   --pretty-aui-composer-max-width: 780px;
   --pretty-aui-gutter: 16px;
@@ -125,3 +148,6 @@ The root accepts these public custom properties:
 
 These properties cross the standalone Shadow DOM through the host element.
 The package supplies fallback values at consumption sites, so host values win.
+When `--pretty-aui-height: 100%` is used, the standalone mount target supplies
+the definite height; the package-owned Shadow wrapper passes it to the chat
+root and leaves outer sizing with the host.

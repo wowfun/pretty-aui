@@ -10,6 +10,7 @@ import {
   createChat,
   createWebSocketConnector,
   type ChatColorScheme,
+  type ContextProvider,
   type ChatSurface,
   type ToolActivityRenderer,
 } from "../../../src/react/index.js";
@@ -30,12 +31,20 @@ const environmentSurface = (
 ).env?.VITE_PRETTY_AUI_SURFACE;
 const surface = asSurface(query.get("surface") ?? environmentSurface ?? null);
 const manualComposition = query.get("composition") === "manual";
+const discloseContext = query.get("context") === "1";
+const composerContext = query.get("composerContext") === "1";
 const harness = liveUrl
   ? undefined
   : createV1Harness({
       afterThoughtDelayMs: asDelay(query.get("thoughtDelay")),
       afterSubagentDelayMs: asDelay(query.get("subagentDelay")),
+      ...(query.get("usage") === "extreme"
+        ? { usage: { used: Number.MAX_VALUE, size: Number.MAX_VALUE } }
+        : {}),
     });
+const contextProvider = composerContext
+  ? createDemoContextProvider()
+  : undefined;
 const controller = createChat({
   connector: liveUrl
     ? createWebSocketConnector(liveUrl, {
@@ -46,10 +55,75 @@ const controller = createChat({
   session: {
     cwd: query.get("cwd") ?? injectedLive?.cwd ?? "/workspace/pretty-aui",
   },
+  ...(contextProvider
+    ? { context: contextProvider }
+    : discloseContext
+      ? {
+          context: [
+            {
+              id: "workspace-evidence",
+              label: "Workspace evidence",
+              content: [
+                {
+                  type: "text" as const,
+                  text: [
+                    "Evaluation cell: cell_ff84f016f10d5d9aa7f2",
+                    "Dataset: pbench-v1.0/web-fetch-01",
+                    "Instruction: inspect the captured evidence literally.",
+                  ].join("\n"),
+                },
+                {
+                  type: "resource" as const,
+                  resource: {
+                    uri: "peval://trial/web-fetch-01",
+                    mimeType: "application/json",
+                    text: '{"score":0,"status":"digest_mismatch"}',
+                  },
+                },
+              ],
+            },
+          ],
+        }
+      : {}),
   onEvent(event) {
     if (event.type === "error") console.error(event.error);
   },
 });
+
+function createDemoContextProvider(): ContextProvider {
+  let selection = [
+    { id: "workspace-evidence", label: "Workspace evidence" },
+    { id: "task-audit", label: "pbench-v1.0 / web-fetch-01" },
+  ];
+  const listeners = new Set<() => void>();
+  return {
+    getSelection: () => selection,
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    add() {
+      if (selection.some((item) => item.id === "report")) return;
+      selection = [...selection, { id: "report", label: "Failure report" }];
+      for (const listener of listeners) listener();
+    },
+    remove(id) {
+      selection = selection.filter((item) => item.id !== id);
+      for (const listener of listeners) listener();
+    },
+    resolve(request) {
+      return request.selection.map((item) => ({
+        ...item,
+        content: [
+          {
+            type: "text" as const,
+            text: `Literal context for ${item.label}`,
+          },
+        ],
+      }));
+    },
+  };
+}
 
 declare global {
   interface Window {

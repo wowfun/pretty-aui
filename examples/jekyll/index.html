@@ -78,11 +78,13 @@ layout: null
       const bridge = params.get("acp") ?? injectedLive?.url ?? "ws://127.0.0.1:7331/acp";
       const requestedScheme = params.get("scheme");
       const mounted = mountChat(document.querySelector("#chat"), {
-        connector: createWebSocketConnector(bridge, {
-          ...(bridge === injectedLive?.url ? { protocols: injectedLive.protocols } : {}),
-        }),
-        protocol: 1,
-        session: { cwd: params.get("cwd") ?? injectedLive?.cwd ?? {{ site.source | jsonify }} },
+        options: {
+          connector: createWebSocketConnector(bridge, {
+            ...(bridge === injectedLive?.url ? { protocols: injectedLive.protocols } : {}),
+          }),
+          protocol: 1,
+          session: { cwd: params.get("cwd") ?? injectedLive?.cwd ?? {{ site.source | jsonify }} },
+        },
         surface: params.get("surface") === "sidebar" ? "sidebar" : "inline",
         colorScheme: requestedScheme === "light" || requestedScheme === "dark" ? requestedScheme : "system",
       });

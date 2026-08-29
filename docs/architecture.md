@@ -27,18 +27,35 @@ animation frame while always reading the controller's latest immutable state.
 
 Core is framework-neutral. Shared labels, color scheme, and surface vocabulary
 are React-free presentation contracts. React owns component props, visual
-tokens, and tool rendering. Standalone owns a controller and
-mounts the same React composition into a newly attached open Shadow DOM; it
-refuses an existing or concurrently owned shadow root and is not a second
-renderer. A controller passed to React remains caller-owned. A controller
-created from immutable `options` is destroyed with its owning root.
+tokens, and tool rendering. Standalone mounts the same React composition into a
+newly attached open Shadow DOM and is not a second renderer. It accepts either
+a caller-owned controller or immutable controller options, never both. A
+borrowed controller outlives the mount; an options-owned controller is destroyed
+with its root. Standalone refuses an existing or concurrently owned shadow
+root, exposes bounded draft and composer-focus operations instead of requiring
+Shadow DOM traversal, and can nonce its package-owned style for a strict host
+CSP.
 Controller ownership is terminal: late connection or session work cannot
-commit after destruction. Foreground turns, reconnects, session mutations, and
-session-list requests are each single-flight; reconnect cannot replace a
-session while its turn or interaction is active. Permission requests are
-accepted only for the active turn and session. URL elicitation completion is correlated by the agent-provided
-elicitation identity and resolves through the same interaction seam as a local
-response.
+commit after destruction. One controller owns one connection and at most 16
+loaded session records. Loading reservations and new-session creation share
+one capacity and lifecycle boundary; connection replacement/new-session work
+and target-session mutations are mutually exclusive, while mutations for
+different target sessions may overlap. Prompts cannot begin while their target
+session is being mutated. Each loaded record has an opaque incarnation identity
+that survives restoration of the same logical session but changes whenever a
+fresh local record is created, even if an Agent reuses the same session ID.
+Each record owns its timeline, turn, configuration, usage, protocol state, and
+interactions. A session permits one turn at a time
+while different sessions may run concurrently. Selecting a loaded session
+changes only the active snapshot projection; it never closes or cancels another
+session. Session operations are single-flight per target, and connection
+replacement is single-flight for the whole controller. Concurrent session-list
+reads for the same cursor share one request; a different cursor remains busy so
+pagination cannot commit out of order. Unknown-session updates are diagnosed
+without allocating state. Permission requests remain with their owning session
+and surface a background badge rather than stealing the active selection. URL
+elicitation completion is correlated by the agent-provided elicitation identity
+and resolves through the same interaction seam as a local response.
 Child-session navigation is an explicit controller operation. A successful
 child open appends the previous active session to `sessionTrail`; a successful
 ancestor open truncates that trail. Ordinary history opens, new sessions, and
@@ -46,11 +63,13 @@ session close clear it. Failed, superseded, busy, or destroyed operations leave
 the active session and trail unchanged, while reconnecting the same active
 session preserves the trail. The trail records only navigation observed by
 this controller; ACP does not provide authoritative session lineage.
-Reconnect preserves the active session through resume when available, or a
-full load for load-only ACP v1 agents; it creates a new session only when the
-agent exposes neither capability. That fallback is a genuinely fresh session
-and starts with an empty timeline rather than relabeling the previous
-transcript.
+Reconnect is rejected while any loaded session has an active turn or
+interaction. It restores the selected session first and then other loaded
+sessions serially through resume when available or full load for load-only ACP
+v1 agents. Failure to restore the selected session fails the connection
+replacement; failure to restore a background session marks only that record as
+failed. An agent exposing neither capability receives one genuinely fresh
+session and the prior loaded records are discarded rather than relabeled.
 The package root, `./core`, and `./standalone` entries are React-free;
 `./react` is the only entry whose interface requires the optional React peers.
 Borrowed-controller rendering supports SSR from the controller's current
@@ -63,6 +82,28 @@ width of its own container and never mutates `body`, installs a viewport-level
 layout, or portals an outer sidebar. Manual composition and theming contracts
 are specified in [Composition](composition.md).
 
+Controller construction may connect without creating a session, create a new
+session, or open a named session. The default remains new-session creation.
+An Agent JSON-RPC rejection of session creation/opening crosses the adapter as
+a structured `SESSION_REJECTED` error with the owning `session/new` or
+`session/open` phase, so hosts can distinguish a stale saved session from
+transport initialization. Local connection and validation failures retain
+their existing structured codes instead of being relabeled as Agent rejection.
+The context-provider adapter owns the observable selection for the next turn,
+including optional add and remove operations, while the controller owns its
+bounded immutable projection. Sending freezes that selection before resolution.
+The provider receives the frozen IDs, labels, initialized prompt capabilities,
+and user input, and must return the same IDs in the same order; it can therefore
+choose embedded resources or a text fallback without letting composer state,
+wire content, and transparency records diverge. Context is prepended to the ACP
+prompt but committed to the owning session's timeline only after prompt dispatch
+starts. Each accepted item becomes a package-owned context activity following
+that turn's user message, preserving the exact bounded blocks sent for the
+lifetime of the loaded controller session. Context activities are not
+reconstructed from unmarked Agent history and are not a second durable session
+store. A host may forbid agent authentication; an agent that requires it then
+fails explicitly without presenting or sending authentication operations.
+
 ## Trust
 
 The host owns endpoint authentication and client handlers. Protocol adapters
@@ -73,17 +114,24 @@ DOMPurify through an isomorphic adapter as defense in depth. Durable and
 external inputs are validated at their owning seam, and custom tool renderers
 receive normalized `ChatToolCall` values rather than raw protocol messages.
 
-The default protocol budgets are 2 MiB per decoded wire message, 1,000 retained
-activities per session, 256 items per normalized collection, 256 content blocks
-per message, 1 MiB per text or terminal value, 8 MiB per base64 media value, and
-16 simultaneous interactions. Structured payloads are copied to at most 4,096
-nodes and 16 levels. Each terminal accepts at most 4,096 output chunks and 4 MiB
+The default protocol budgets are 2 MiB per decoded inbound or outbound wire
+message, 16 loaded
+sessions, 1,000 retained activities per session, 256 items per normalized
+collection, 256 content blocks per message, 1 MiB per text or terminal value, 8
+MiB per base64 media value, and 16 simultaneous interactions across the
+controller. Loading reservations count toward the session limit; capacity
+failure occurs before a remote session operation, and records are never
+implicitly evicted or remotely closed. Structured payloads are copied to at
+most 4,096 nodes and 16 levels. Each terminal accepts at most 4,096 output chunks and 4 MiB
 of decoded output during its retained lifetime while exposing only its newest
 1 MiB. Numeric usage values must be finite and non-negative. Text truncation
 preserves valid UTF-16 boundaries; a streamed text value retains its newest
-content so a concluding fragment is not discarded. URI-bearing content accepts
-only absolute `http`, `https`, or `file` URIs. Decoded wire-message text is
-measured in UTF-8 bytes rather than JavaScript code units. Values beyond these budgets are
+content so a concluding fragment is not discarded. Navigable content accepts
+only absolute `http`, `https`, or `file` URIs; inert resource identifiers may
+use other absolute schemes such as a host-owned `peval:` URI and are never
+navigated or fetched by the built-in renderer. Decoded wire messages are
+measured as serialized JSON in UTF-8 bytes rather than JavaScript code units.
+Values beyond these budgets are
 rejected, truncated, or evicted at the protocol normalization seam according
 to whether partial data remains meaningful.
 
@@ -92,7 +140,24 @@ is active; late state notifications are ignored and diagnosed. An interaction
 beyond the simultaneous limit is cancelled and emits an `INTERACTION_LIMIT`
 diagnostic so hosts can observe the denial. Once a v2 cancellation notification
 has been accepted locally, the pending foreground turn settles as cancelled
-without depending on a later agent `idle` notification.
+without depending on a later agent `idle` notification. Because v2 state
+updates carry no turn identity, that session remains in `cancelling` and rejects
+another prompt until the Agent's `idle` acknowledgement arrives; reconnect is
+the recovery path for a non-conforming Agent that never acknowledges
+cancellation. A late cancellation `idle` can therefore never settle a
+replacement turn.
+
+Every module emitted for the standalone browser entry pre-populates Zod's
+documented cross-copy global configuration with `jitless: true` before bundled
+SDK code runs, so the compatibility probe is not evaluated under a strict CSP.
+This also selects Zod's non-JIT validation path for other Zod copies on the same
+page. The entry's only inline style element is package-owned and accepts the
+host-provided CSP nonce. Presentation code may use bounded CSSOM property
+updates, but does not serialize untrusted style attributes. The standalone
+mount's package-owned wrapper fills a mount target that supplies a definite
+height, carrying percentage height through the Shadow DOM so the transcript
+remains the scroll owner while the composer stays inside the host. The adapter
+never assigns the host or viewport size.
 
 Caller-supplied Streamable HTTP authentication headers follow only bounded,
 same-origin redirects when the injected fetch implementation exposes redirect

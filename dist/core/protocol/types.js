@@ -1,3 +1,4 @@
+import { RequestError } from "@agentclientprotocol/sdk";
 import { PrettyAuiError } from "../errors.js";
 import { MAX_CONTENT_TEXT, MAX_MEDIA_BASE64 } from "./normalize.js";
 export function validateSessionOptions(options, initialization, protocol, phase) {
@@ -41,10 +42,12 @@ export async function requestSessionWithAuthMapping(request, protocol, phase) {
         return await request();
     }
     catch (error) {
-        if (error instanceof Error && "code" in error && error.code === -32000) {
+        if (!(error instanceof RequestError))
+            throw error;
+        if (error.code === -32000) {
             throw new PrettyAuiError("AUTHENTICATION_REQUIRED", "The agent requires authentication for this session operation", { cause: error, protocol, phase });
         }
-        throw error;
+        throw new PrettyAuiError("SESSION_REJECTED", `The agent rejected ${phase}`, { cause: error, protocol, phase, retryable: phase === "session/open" });
     }
 }
 function validateContentBlockBounds(block, protocol) {

@@ -1,14 +1,9 @@
-import type { AcpProtocolVersion, AcpWireStream, AuthMethod, ChatCapabilities, ChatCommand, ChatConfigOption, ContentBlock, ElicitationDecision, ElicitationInteraction, PermissionDecision, PermissionInteraction, SessionOptions, SessionPage } from "../types.js";
+import type { AcpProtocolVersion, AcpWireStream, AuthMethod, ChatCapabilities, ChatCommand, ChatConfigOption, ContentBlock, ElicitationDecision, ElicitationInteraction, PermissionDecision, PermissionInteraction, PromptCapabilities, SessionOptions, SessionPage } from "../types.js";
 export interface ProtocolSession {
     readonly sessionId: string;
     readonly configOptions: readonly ChatConfigOption[];
     readonly commands?: readonly ChatCommand[];
     readonly historyGap?: boolean;
-}
-export interface PromptCapabilities {
-    readonly image: boolean;
-    readonly audio: boolean;
-    readonly embeddedContext: boolean;
 }
 export interface ProtocolInitialization {
     readonly protocolVersion: AcpProtocolVersion;
@@ -39,6 +34,8 @@ export interface ProtocolDriver {
     listSessions(cwd: string, cursor?: string): Promise<SessionPage>;
     deleteSession(sessionId: string): Promise<void>;
     closeSession(sessionId: string): Promise<void>;
+    /** Whether protocol state can safely correlate a new prompt for the session. */
+    promptReady(sessionId: string): boolean;
     prompt(sessionId: string, prompt: readonly ContentBlock[], 
     /** Called once request dispatch has begun; it is not a remote success ack. */
     onAccepted: () => void): Promise<string>;

@@ -9,12 +9,18 @@ const controllerKeys = new WeakMap();
 let controllerKeyCounter = 0;
 const CONNECTING_SNAPSHOT = {
     phase: "connecting",
+    loadedSessions: [],
     sessionTrail: [],
     historyGap: false,
     activities: [],
-    contextItems: [],
     configOptions: [],
     commands: [],
+    contextSelection: {
+        items: [],
+        canAdd: false,
+        canRemove: false,
+        busy: false,
+    },
     interactions: [],
     authMethods: [],
     capabilities: {
@@ -33,6 +39,8 @@ const CONNECTING_CONTROLLER = {
         throw new Error("The chat session is still connecting");
     },
     async cancel() { },
+    async addContext() { },
+    async removeContext() { },
     async reconnect() { },
     async newSession() { },
     async listSessions() {
@@ -133,6 +141,11 @@ export function ChatHeader() {
     const [sessionsOpen, setSessionsOpen] = useState(false);
     const currentTitle = snapshot.sessionTitle ?? labels.sessionUntitled;
     const parent = snapshot.sessionTrail.at(-1);
+    const canCreateSession = snapshot.protocolVersion !== undefined &&
+        snapshot.phase !== "connecting" &&
+        snapshot.phase !== "auth_required" &&
+        snapshot.phase !== "closed" &&
+        snapshot.loadedSessions.length < 16;
     return (_jsxs(_Fragment, { children: [_jsxs("header", { className: "paui-header", "data-pretty-aui-slot": "header", children: [_jsxs("div", { className: `paui-identity${parent ? " paui-identity--child" : ""}`, children: [_jsx("span", { className: "paui-presence", "data-phase": snapshot.phase, "aria-hidden": "true" }), parent ? (_jsxs("div", { className: "paui-lineage", "data-depth": snapshot.sessionTrail.length, children: [_jsx("button", { className: "paui-lineage__back", type: "button", disabled: snapshot.phase !== "idle", "aria-label": labels.backToSession(parent.title ?? parent.sessionId), onClick: () => runAction(() => controller.openAncestorSession(parent.sessionId)), children: _jsx(BackIcon, {}) }), _jsxs("div", { className: "paui-lineage__titles", children: [snapshot.sessionTrail.map((ancestor) => {
                                                 const title = ancestor.title ?? ancestor.sessionId;
                                                 return (_jsxs("span", { className: "paui-lineage__ancestor", children: [_jsx("button", { type: "button", disabled: snapshot.phase !== "idle", onClick: () => runAction(() => controller.openAncestorSession(ancestor.sessionId)), children: title }), _jsx("span", { "aria-hidden": "true", children: "/" })] }, ancestor.sessionId));
@@ -140,7 +153,8 @@ export function ChatHeader() {
                                             ? `ACP v${snapshot.protocolVersion}`
                                             : snapshot.phase })] })) : (_jsxs("div", { children: [_jsx("strong", { children: currentTitle }), _jsx("span", { className: "paui-protocol", children: snapshot.protocolVersion
                                             ? `ACP v${snapshot.protocolVersion}`
-                                            : snapshot.phase })] }))] }), _jsxs("div", { className: "paui-header__actions", children: [snapshot.capabilities.listSessions ? (_jsxs("button", { className: "paui-icon-button", type: "button", onClick: () => setSessionsOpen(true), children: [_jsx(HistoryIcon, {}), _jsx("span", { className: "paui-sr-only", children: labels.sessions })] })) : null, _jsxs("button", { className: "paui-icon-button", type: "button", disabled: snapshot.phase !== "idle", onClick: () => runAction(() => controller.newSession()), children: [_jsx(NewChatIcon, {}), _jsx("span", { className: "paui-sr-only", children: labels.newChat })] })] })] }), sessionsOpen ? (_jsx(SessionDrawer, { controller: controller, snapshot: snapshot, labels: labels, onClose: () => setSessionsOpen(false) })) : null] }));
+                                            : snapshot.phase })] }))] }), _jsxs("div", { className: "paui-header__actions", children: [snapshot.usage ? (_jsx("span", { className: "paui-usage", children: labels.usage(snapshot.usage.used, snapshot.usage.size) })) : null, snapshot.capabilities.listSessions ||
+                                snapshot.loadedSessions.length > 1 ? (_jsxs("button", { className: "paui-icon-button", type: "button", onClick: () => setSessionsOpen(true), children: [_jsx(HistoryIcon, {}), _jsx("span", { className: "paui-sr-only", children: labels.sessions })] })) : null, _jsxs("button", { className: "paui-icon-button", type: "button", disabled: !canCreateSession, onClick: () => runAction(() => controller.newSession()), children: [_jsx(NewChatIcon, {}), _jsx("span", { className: "paui-sr-only", children: labels.newChat })] })] })] }), sessionsOpen ? (_jsx(SessionDrawer, { controller: controller, snapshot: snapshot, labels: labels, onClose: () => setSessionsOpen(false) })) : null] }));
 }
 /** Renders normalized conversation history and owns transcript scrolling. */
 export function ChatTranscript() {
@@ -149,6 +163,9 @@ export function ChatTranscript() {
     const contentRef = useRef(null);
     const pinnedRef = useRef(true);
     const lastScrollTopRef = useRef(0);
+    const sessionKey = sessionCacheKey(snapshot);
+    const sessionRef = useRef(sessionKey);
+    const sessionScrollRef = useRef(new Map());
     const [pinned, setPinned] = useState(true);
     const scrollToBottom = useCallback((behavior = "auto") => {
         const scroller = scrollerRef.current;
@@ -173,8 +190,35 @@ export function ChatTranscript() {
         const next = distance <= 24 ? true : movedUp ? false : pinnedRef.current;
         lastScrollTopRef.current = scroller.scrollTop;
         pinnedRef.current = next;
+        sessionScrollRef.current.set(sessionKey, {
+            top: scroller.scrollTop,
+            pinned: next,
+        });
         setPinned(next);
-    }, []);
+    }, [sessionKey]);
+    useLayoutEffect(() => {
+        const previousSessionKey = sessionRef.current;
+        if (previousSessionKey === sessionKey)
+            return;
+        const scroller = scrollerRef.current;
+        if (!scroller)
+            return;
+        sessionScrollRef.current.set(previousSessionKey, {
+            top: scroller.scrollTop,
+            pinned: pinnedRef.current,
+        });
+        sessionRef.current = sessionKey;
+        const restored = sessionScrollRef.current.get(sessionKey);
+        if (restored) {
+            scroller.scrollTop = restored.top;
+            lastScrollTopRef.current = restored.top;
+            pinnedRef.current = restored.pinned;
+            setPinned(restored.pinned);
+        }
+        else {
+            scrollToBottom();
+        }
+    }, [scrollToBottom, sessionKey]);
     useLayoutEffect(() => {
         if (pinnedRef.current)
             scrollToBottom();
@@ -193,10 +237,10 @@ export function ChatTranscript() {
         return () => observer.disconnect();
     }, [scrollToBottom]);
     const groups = useMemo(() => groupActivities(snapshot.activities), [snapshot.activities]);
-    return (_jsxs("main", { ref: scrollerRef, className: "paui-body", "data-pretty-aui-slot": "transcript", tabIndex: 0, onScroll: updatePinned, children: [_jsxs("div", { className: "paui-transcript", ref: contentRef, children: [snapshot.historyGap ? (_jsxs("aside", { className: "paui-notice", role: "status", children: [_jsx(InfoIcon, {}), _jsxs("div", { children: [_jsx("strong", { children: labels.historyGapTitle }), _jsx("span", { children: labels.historyGap })] })] })) : null, !snapshot.activities.length ? (_jsxs("div", { className: "paui-empty", children: [_jsx(SparkIcon, {}), _jsx("strong", { children: labels.emptyTitle }), _jsx("p", { children: labels.emptyDescription })] })) : null, groups.map((group, index) => (_jsx(TurnGroup, { group: group, labels: labels, toolActivityRenderer: toolActivityRenderer, active: index === groups.length - 1 &&
-                            (snapshot.phase === "running" ||
-                                snapshot.phase === "awaiting_user" ||
-                                snapshot.phase === "cancelling") }, group.id)))] }), !pinned ? (_jsx("button", { className: "paui-to-bottom", type: "button", onClick: () => scrollToBottom("smooth"), "aria-label": "Scroll to latest message", children: _jsx(DownIcon, {}) })) : null] }));
+    return (_jsxs(_Fragment, { children: [_jsx("main", { ref: scrollerRef, className: "paui-body", "data-pretty-aui-slot": "transcript", tabIndex: 0, onScroll: updatePinned, children: _jsxs("div", { className: "paui-transcript", ref: contentRef, children: [snapshot.historyGap ? (_jsxs("aside", { className: "paui-notice", role: "status", children: [_jsx(InfoIcon, {}), _jsxs("div", { children: [_jsx("strong", { children: labels.historyGapTitle }), _jsx("span", { children: labels.historyGap })] })] })) : null, !snapshot.activities.length ? (_jsxs("div", { className: "paui-empty", children: [_jsx(SparkIcon, {}), _jsx("strong", { children: labels.emptyTitle }), _jsx("p", { children: labels.emptyDescription })] })) : null, groups.map((group, index) => (_jsx(TurnGroup, { group: group, labels: labels, toolActivityRenderer: toolActivityRenderer, active: index === groups.length - 1 &&
+                                (snapshot.phase === "running" ||
+                                    snapshot.phase === "awaiting_user" ||
+                                    snapshot.phase === "cancelling") }, group.id)))] }) }), !pinned ? (_jsx("div", { className: "paui-to-bottom-row", children: _jsx("button", { className: "paui-to-bottom", type: "button", onClick: () => scrollToBottom("smooth"), "aria-label": labels.scrollToLatest, children: _jsx(DownIcon, {}) }) })) : null] }));
 }
 /** Renders authentication, ACP interactions, and reconnectable errors. */
 export function ChatInteractions() {
@@ -260,18 +304,61 @@ function ActivityView({ activity, labels, toolActivityRenderer, running, }) {
     switch (activity.type) {
         case "message":
             return (_jsx(MessageView, { message: activity, labels: labels, running: running }));
+        case "context":
+            return _jsx(ContextActivity, { activity: activity, labels: labels });
         case "tool":
             if (activity.subagent) {
                 return (_jsx(SubagentActivity, { tool: activity, labels: labels, renderer: toolActivityRenderer }));
             }
             return (_jsxs("details", { className: "paui-disclosure paui-tool", "data-state": activity.status, children: [_jsxs("summary", { className: "paui-flow-summary", children: [_jsx(DisclosureLeading, { icon: _jsx(ToolKindIcon, { kind: activity.kind }) }), _jsx("span", { className: "paui-flow-title", children: flowTitle(activity.kind, labels.tool) }), _jsx("span", { className: "paui-flow-separator", "aria-hidden": "true" }), _jsx("span", { className: "paui-flow-preview", children: activity.title }), _jsx("span", { className: "paui-sr-only", children: activity.status })] }), _jsx("div", { className: "paui-disclosure__body", children: _jsx(ToolBody, { tool: activity, labels: labels, renderer: toolActivityRenderer }) })] }));
         case "plan":
-            return (_jsxs("details", { className: "paui-disclosure paui-plan", open: true, children: [_jsxs("summary", { children: [_jsx(PlanIcon, {}), _jsx("span", { children: "Plan" }), _jsx(StatusBadge, { status: planStatus(activity.entries) })] }), _jsx("ol", { className: "paui-plan__list", children: activity.entries.map((entry, index) => (_jsxs("li", { "data-status": entry.status, children: [_jsx("span", { className: "paui-plan__mark", "aria-hidden": "true" }), _jsx("span", { children: entry.content })] }, `${entry.content}-${index}`))) })] }));
+            return (_jsxs("details", { className: "paui-disclosure paui-plan", open: true, children: [_jsxs("summary", { children: [_jsx(PlanIcon, {}), _jsx("span", { children: labels.plan }), _jsx(StatusBadge, { status: planStatus(activity.entries) })] }), _jsx("ol", { className: "paui-plan__list", children: activity.entries.map((entry, index) => (_jsxs("li", { "data-status": entry.status, children: [_jsx("span", { className: "paui-plan__mark", "aria-hidden": "true" }), _jsx("span", { children: entry.content })] }, `${entry.content}-${index}`))) })] }));
         case "terminal":
             return (_jsxs("details", { className: "paui-disclosure paui-terminal", children: [_jsxs("summary", { children: [_jsx(TerminalIcon, {}), _jsx("span", { children: activity.title }), _jsx(StatusBadge, { status: activity.exited ? "completed" : "in_progress" })] }), _jsx("pre", { children: activity.output })] }));
         case "unsupported":
             return (_jsx("div", { className: "paui-unsupported", children: labels.unsupportedContent(activity.kind) }));
     }
+}
+function ContextActivity({ activity, labels, }) {
+    return (_jsxs("details", { className: "paui-disclosure paui-context-injection", children: [_jsxs("summary", { className: "paui-flow-summary", children: [_jsx(DisclosureLeading, { icon: _jsx(ContextIcon, {}) }), _jsx("span", { className: "paui-flow-title", children: labels.contextInjection }), _jsx("span", { className: "paui-flow-separator", "aria-hidden": "true" }), _jsx("span", { className: "paui-flow-preview", children: activity.label })] }), _jsx("div", { className: "paui-context-injection__body", tabIndex: 0, children: activity.content.map((block, index) => (_jsx(ContextBlockView, { block: block, labels: labels }, `${activity.id}:${index}`))) })] }));
+}
+function ContextBlockView({ block, labels, }) {
+    if (block.type === "text" && typeof block.text === "string") {
+        return _jsx(ContextLiteralText, { text: block.text, labels: labels });
+    }
+    if (block.type === "resource" && isRecord(block.resource)) {
+        const resource = block.resource;
+        return (_jsxs("section", { className: "paui-context-block", children: [_jsxs("div", { className: "paui-context-meta", children: [_jsx("span", { children: String(resource.uri ?? labels.resource) }), typeof resource.mimeType === "string" ? (_jsx("span", { children: resource.mimeType })) : null] }), typeof resource.text === "string" ? (_jsx(ContextLiteralText, { text: resource.text, labels: labels })) : typeof resource.blob === "string" ? (_jsx("span", { className: "paui-muted", children: `Binary resource · ${resource.blob.length.toLocaleString()} base64 characters` })) : null] }));
+    }
+    if (block.type === "resource_link" && typeof block.uri === "string") {
+        const title = typeof block.title === "string"
+            ? block.title
+            : typeof block.name === "string"
+                ? block.name
+                : labels.resource;
+        const mimeType = typeof block.mimeType === "string" ? block.mimeType : undefined;
+        const description = typeof block.description === "string" ? block.description : undefined;
+        return (_jsxs("section", { className: "paui-context-block", children: [_jsxs("div", { className: "paui-context-meta", children: [_jsx("span", { children: title }), mimeType ? _jsx("span", { children: mimeType }) : null] }), _jsx("span", { className: "paui-context-identifier", children: block.uri }), description ? _jsx("span", { children: description }) : null] }));
+    }
+    if ((block.type === "image" || block.type === "audio") &&
+        typeof block.mimeType === "string" &&
+        typeof block.data === "string") {
+        return (_jsx("span", { className: "paui-context-meta", children: `${flowTitle(block.type, block.type)} · ${block.mimeType} · ${block.data.length.toLocaleString()} base64 characters` }));
+    }
+    return (_jsx(ContextLiteralText, { text: formatRawToolValue(block), labels: labels }));
+}
+function ContextLiteralText({ text, labels, }) {
+    const bounded = boundContextText(text);
+    return (_jsxs(_Fragment, { children: [_jsx("pre", { className: "paui-context-text", children: bounded.text }), bounded.truncated ? (_jsx("span", { className: "paui-context-truncated", children: labels.contextTruncated(text.length) })) : null] }));
+}
+function boundContextText(text) {
+    if (text.length <= 20_000)
+        return { text, truncated: false };
+    let end = 20_000;
+    const last = text.charCodeAt(end - 1);
+    if (last >= 0xd800 && last <= 0xdbff)
+        end -= 1;
+    return { text: text.slice(0, end), truncated: true };
 }
 function SubagentActivity({ tool, labels, renderer, }) {
     const { controller, snapshot, runAction } = useChatContext("ChatTranscript");
@@ -405,7 +492,13 @@ function ToolBody({ tool, labels, renderer, }) {
     return renderer ? (_jsx(ToolRendererBoundary, { fallback: fallback, resetKey: tool.id, children: _jsx(CustomToolBody, { tool: tool, renderer: renderer, fallback: fallback }) }, tool.id)) : (fallback);
 }
 function DefaultToolBody({ tool, labels, }) {
-    return tool.content.length ? (tool.content.map((content, index) => (_jsx(ToolContentView, { value: content, labels: labels }, index)))) : (_jsx("span", { className: "paui-muted", children: labels.tool }));
+    if (tool.content.length) {
+        return tool.content.map((content, index) => (_jsx(ToolContentView, { value: content, labels: labels }, index)));
+    }
+    if (tool.rawInput === undefined && tool.rawOutput === undefined) {
+        return _jsx("span", { className: "paui-muted", children: labels.tool });
+    }
+    return (_jsxs("div", { className: "paui-tool-raw", children: [tool.rawInput !== undefined ? (_jsxs("section", { children: [_jsx("strong", { children: labels.toolInput }), _jsx("pre", { children: formatRawToolValue(tool.rawInput) })] })) : null, tool.rawOutput !== undefined ? (_jsxs("section", { children: [_jsx("strong", { children: labels.toolOutput }), _jsx("pre", { children: formatRawToolValue(tool.rawOutput) })] })) : null] }));
 }
 function CustomToolBody({ tool, renderer, fallback, }) {
     const rendered = renderer(tool);
@@ -453,11 +546,11 @@ function ContentView({ block, labels, }) {
             : typeof block.name === "string"
                 ? block.name
                 : block.uri;
-        return safeUrl(block.uri) ? (_jsxs("a", { className: "paui-resource", href: block.uri, target: "_blank", rel: "noreferrer", children: [_jsx(LinkIcon, {}), _jsx("span", { children: title })] })) : (_jsx("span", { className: "paui-unsupported", children: labels.unsupportedContent("unsafe resource link") }));
+        return safeUrl(block.uri) ? (_jsxs("a", { className: "paui-resource", href: block.uri, target: "_blank", rel: "noreferrer", children: [_jsx(LinkIcon, {}), _jsx("span", { children: title })] })) : (_jsx("span", { className: "paui-unsupported", children: labels.unsupportedContent(labels.unsafeResourceLink) }));
     }
     if (block.type === "resource" && isRecord(block.resource)) {
         const resource = block.resource;
-        const uri = typeof resource.uri === "string" ? resource.uri : "Resource";
+        const uri = typeof resource.uri === "string" ? resource.uri : labels.resource;
         if (typeof resource.text === "string") {
             return (_jsxs("details", { className: "paui-resource", children: [_jsxs("summary", { children: [_jsx(FileIcon, {}), uri] }), _jsx("pre", { children: resource.text })] }));
         }
@@ -474,18 +567,18 @@ function ToolContentView({ value, labels, }) {
         return (_jsx(ContentView, { block: value.content, labels: labels }));
     }
     if (value.type === "diff") {
-        const path = typeof value.path === "string" ? value.path : "Changed files";
+        const path = typeof value.path === "string" ? value.path : labels.changedFiles;
         const patch = typeof value.patch === "string"
             ? value.patch
             : typeof value.newText === "string"
                 ? value.newText
                 : undefined;
-        return (_jsxs("details", { className: "paui-diff", children: [_jsxs("summary", { children: [_jsx(DiffIcon, {}), path] }), patch ? (_jsx("pre", { children: patch })) : (_jsx("span", { className: "paui-muted", children: "Binary or structural change" }))] }));
+        return (_jsxs("details", { className: "paui-diff", children: [_jsxs("summary", { children: [_jsx(DiffIcon, {}), path] }), patch ? (_jsx("pre", { children: patch })) : (_jsx("span", { className: "paui-muted", children: labels.binaryChange }))] }));
     }
     if (value.type === "terminal") {
-        return (_jsxs("span", { className: "paui-muted", children: [_jsx(TerminalIcon, {}), " Terminal output is shown in the activity stream."] }));
+        return (_jsxs("span", { className: "paui-muted", children: [_jsx(TerminalIcon, {}), " ", labels.terminalOutputInActivity] }));
     }
-    return (_jsx("span", { className: "paui-unsupported", children: labels.unsupportedContent(typeof value.type === "string" ? value.type : "tool result") }));
+    return (_jsx("span", { className: "paui-unsupported", children: labels.unsupportedContent(typeof value.type === "string" ? value.type : labels.toolResult) }));
 }
 /** Renders draft entry, commands, context, configuration, send, and cancel. */
 export function ChatComposer() {
@@ -495,7 +588,9 @@ export function ChatComposer() {
     const [commandsDismissed, setCommandsDismissed] = useState(false);
     const composingRef = useRef(false);
     const textareaRef = useRef(null);
-    const sessionRef = useRef(snapshot.sessionId);
+    const sessionKey = sessionCacheKey(snapshot);
+    const sessionRef = useRef(sessionKey);
+    const draftsRef = useRef(new Map());
     const placement = snapshot.activities.length ||
         snapshot.interactions.length ||
         snapshot.phase === "auth_required" ||
@@ -503,13 +598,18 @@ export function ChatComposer() {
         ? "docked"
         : "hero";
     useEffect(() => {
-        if (sessionRef.current !== snapshot.sessionId) {
-            const previousSessionId = sessionRef.current;
-            sessionRef.current = snapshot.sessionId;
-            if (previousSessionId !== undefined)
-                setValue("");
+        if (sessionRef.current !== sessionKey) {
+            const previousSessionKey = sessionRef.current;
+            draftsRef.current.set(previousSessionKey, value);
+            sessionRef.current = sessionKey;
+            let restored = draftsRef.current.get(sessionKey);
+            if (previousSessionKey === undefined && restored === undefined) {
+                restored = value;
+                draftsRef.current.set(sessionKey, value);
+            }
+            setValue(restored ?? "");
         }
-    }, [snapshot.sessionId]);
+    }, [sessionKey, value]);
     useLayoutEffect(() => {
         const textarea = textareaRef.current;
         if (!textarea)
@@ -528,16 +628,24 @@ export function ChatComposer() {
         const prompt = value.trim();
         if (!prompt || disabled || running)
             return;
+        const ownerSessionKey = sessionKey;
+        draftsRef.current.set(ownerSessionKey, "");
         setValue("");
         setCommandsDismissed(true);
         try {
             const turn = controller.send(prompt);
             void turn.done.catch(() => {
-                setValue((current) => current || prompt);
+                if (!draftsRef.current.get(ownerSessionKey)) {
+                    draftsRef.current.set(ownerSessionKey, prompt);
+                    if (sessionRef.current === ownerSessionKey)
+                        setValue(prompt);
+                }
             });
         }
         catch {
-            setValue(prompt);
+            draftsRef.current.set(ownerSessionKey, prompt);
+            if (sessionRef.current === ownerSessionKey)
+                setValue(prompt);
         }
     };
     const matchingCommands = value.startsWith("/") && !/\s/.test(value.slice(1)) && !commandsDismissed
@@ -547,7 +655,9 @@ export function ChatComposer() {
         : [];
     const selectedCommandIndex = Math.min(commandIndex, Math.max(0, matchingCommands.length - 1));
     const chooseCommand = (name) => {
-        setValue(`/${name} `);
+        const command = `/${name} `;
+        draftsRef.current.set(sessionKey, command);
+        setValue(command);
         setCommandsDismissed(true);
         textareaRef.current?.focus();
     };
@@ -583,10 +693,13 @@ export function ChatComposer() {
         }
     };
     const commandsId = `${ids.instance}-commands`;
-    return (_jsxs("footer", { className: "paui-composer-wrap", "data-pretty-aui-slot": "composer", "data-placement": placement, children: [snapshot.contextItems.length ? (_jsx("div", { className: "paui-context", "aria-label": labels.context, children: snapshot.contextItems.map((item) => (_jsxs("span", { children: [_jsx(ContextIcon, {}), item.label] }, item.id))) })) : null, matchingCommands.length ? (_jsx("div", { className: "paui-commands", role: "listbox", id: commandsId, "aria-label": "Commands", children: matchingCommands.map((command, index) => (_jsxs("button", { type: "button", id: `${commandsId}-${index}`, role: "option", "aria-selected": index === selectedCommandIndex, onMouseDown: (event) => event.preventDefault(), onClick: () => chooseCommand(command.name), children: [_jsxs("code", { children: ["/", command.name] }), _jsx("span", { children: command.description })] }, command.name))) })) : null, _jsxs("div", { className: "paui-composer", "data-pretty-aui-slot": "composer-input", children: [_jsx("textarea", { ref: textareaRef, rows: 1, value: value, disabled: disabled, placeholder: labels.composerPlaceholder, "aria-label": labels.composerPlaceholder, role: "combobox", "aria-autocomplete": "list", "aria-haspopup": "listbox", "aria-controls": matchingCommands.length ? commandsId : undefined, "aria-expanded": Boolean(matchingCommands.length), "aria-activedescendant": matchingCommands.length
+    return (_jsxs("footer", { className: "paui-composer-wrap", "data-pretty-aui-slot": "composer", "data-placement": placement, children: [matchingCommands.length ? (_jsx("div", { className: "paui-commands", role: "listbox", id: commandsId, "aria-label": labels.commands, children: matchingCommands.map((command, index) => (_jsxs("button", { type: "button", id: `${commandsId}-${index}`, role: "option", "aria-selected": index === selectedCommandIndex, onMouseDown: (event) => event.preventDefault(), onClick: () => chooseCommand(command.name), children: [_jsxs("code", { children: ["/", command.name] }), _jsx("span", { children: command.description })] }, command.name))) })) : null, _jsxs("div", { className: "paui-composer", "data-pretty-aui-slot": "composer-input", children: [snapshot.contextSelection.items.length ||
+                        snapshot.contextSelection.canAdd ? (_jsxs("div", { className: "paui-composer__context", "data-pretty-aui-slot": "composer-context", role: "group", "aria-label": labels.contextSelection, children: [snapshot.contextSelection.canAdd ? (_jsx("button", { className: "paui-context-add", type: "button", "aria-label": labels.addContext, title: labels.addContext, disabled: disabled || running || snapshot.contextSelection.busy, onMouseDown: (event) => event.preventDefault(), onClick: () => runAction(() => controller.addContext()), children: _jsx("span", { "aria-hidden": "true", children: "+" }) })) : null, snapshot.contextSelection.items.map((item) => (_jsxs("span", { className: "paui-context-chip", "data-pretty-aui-slot": "composer-context-item", title: item.label, children: [_jsx("span", { className: "paui-context-chip__label", children: item.label }), snapshot.contextSelection.canRemove ? (_jsx("button", { type: "button", "aria-label": labels.removeContext(item.label), title: labels.removeContext(item.label), disabled: disabled || running || snapshot.contextSelection.busy, onMouseDown: (event) => event.preventDefault(), onClick: () => runAction(() => controller.removeContext(item.id)), children: _jsx("span", { "aria-hidden": "true", children: "\u00D7" }) })) : null] }, item.id)))] })) : null, _jsx("textarea", { ref: textareaRef, rows: 1, value: value, disabled: disabled, placeholder: labels.composerPlaceholder, "aria-label": labels.composerPlaceholder, role: "combobox", "aria-autocomplete": "list", "aria-haspopup": "listbox", "aria-controls": matchingCommands.length ? commandsId : undefined, "aria-expanded": Boolean(matchingCommands.length), "aria-activedescendant": matchingCommands.length
                             ? `${commandsId}-${selectedCommandIndex}`
                             : undefined, onInput: (event) => {
-                            setValue(event.currentTarget.value);
+                            const nextValue = event.currentTarget.value;
+                            draftsRef.current.set(sessionKey, nextValue);
+                            setValue(nextValue);
                             setCommandIndex(0);
                             setCommandsDismissed(false);
                         }, onCompositionStart: () => {
@@ -692,6 +805,7 @@ function SessionDrawer({ controller, snapshot, labels, onClose, }) {
     const dialogRef = useRef(null);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState();
+    const sessions = mergeDrawerSessions(snapshot);
     useEffect(() => {
         const activeElement = activeElementFor(dialogRef.current);
         const previousFocus = activeElement instanceof HTMLElement ? activeElement : undefined;
@@ -702,14 +816,14 @@ function SessionDrawer({ controller, snapshot, labels, onClose, }) {
         };
     }, []);
     useEffect(() => {
-        if (!snapshot.sessions) {
+        if (snapshot.capabilities.listSessions && !snapshot.sessions) {
             setLoading(true);
             void controller
                 .listSessions()
                 .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)))
                 .finally(() => setLoading(false));
         }
-    }, [controller, snapshot.sessions]);
+    }, [controller, snapshot.capabilities.listSessions, snapshot.sessions]);
     useEffect(() => {
         const onKey = (event) => {
             if (event.key === "Escape") {
@@ -773,10 +887,28 @@ function SessionDrawer({ controller, snapshot, labels, onClose, }) {
             setLoading(false);
         }
     };
+    const closeSession = async (sessionId) => {
+        setLoading(true);
+        setError(undefined);
+        try {
+            await controller.closeSession(sessionId);
+        }
+        catch (reason) {
+            setError(reason instanceof Error ? reason.message : String(reason));
+        }
+        finally {
+            setLoading(false);
+        }
+    };
     return (_jsx("div", { className: "paui-drawer-backdrop", role: "presentation", onMouseDown: (event) => {
             if (event.target === event.currentTarget)
                 onClose();
-        }, children: _jsxs("aside", { ref: dialogRef, className: "paui-drawer", role: "dialog", "aria-modal": "true", "aria-labelledby": ids.sessionsTitle, children: [_jsxs("header", { children: [_jsx("strong", { id: ids.sessionsTitle, children: labels.sessions }), _jsxs("button", { ref: closeRef, className: "paui-icon-button", type: "button", onClick: onClose, children: [_jsx(CloseIcon, {}), _jsx("span", { className: "paui-sr-only", children: labels.close })] })] }), _jsxs("div", { className: "paui-session-list", children: [loading && !snapshot.sessions ? (_jsx("span", { className: "paui-muted", children: "\u2026" })) : null, !loading && !snapshot.sessions?.sessions.length ? (_jsx("span", { className: "paui-muted", children: labels.noSessions })) : null, snapshot.sessions?.sessions.map((session) => (_jsxs("div", { className: "paui-session", "data-active": session.sessionId === snapshot.sessionId || undefined, children: [_jsxs("button", { type: "button", disabled: loading || session.sessionId === snapshot.sessionId, onClick: () => void select(session.sessionId), children: [_jsx("strong", { children: session.title ?? labels.sessionUntitled }), _jsx("span", { children: formatSessionDate(session.updatedAt) })] }), snapshot.capabilities.deleteSession &&
+        }, children: _jsxs("aside", { ref: dialogRef, className: "paui-drawer", role: "dialog", "aria-modal": "true", "aria-labelledby": ids.sessionsTitle, children: [_jsxs("header", { children: [_jsx("strong", { id: ids.sessionsTitle, children: labels.sessions }), _jsxs("button", { ref: closeRef, className: "paui-icon-button", type: "button", onClick: onClose, children: [_jsx(CloseIcon, {}), _jsx("span", { className: "paui-sr-only", children: labels.close })] })] }), _jsxs("div", { className: "paui-session-list", children: [loading && !snapshot.sessions ? (_jsx("span", { className: "paui-muted", children: "\u2026" })) : null, !loading && !sessions.length ? (_jsx("span", { className: "paui-muted", children: labels.noSessions })) : null, sessions.map((session) => (_jsxs("div", { className: "paui-session", "data-active": session.sessionId === snapshot.sessionId || undefined, children: [_jsxs("button", { type: "button", disabled: loading || session.sessionId === snapshot.sessionId, onClick: () => void select(session.sessionId), children: [_jsx("strong", { children: session.title ?? labels.sessionUntitled }), _jsxs("span", { className: "paui-session__meta", children: [session.loaded
+                                                    ? labels.sessionPhase(session.loaded.phase)
+                                                    : formatSessionDate(session.updatedAt), session.loaded?.interactionCount ? (_jsx("span", { children: labels.pendingInteractions(session.loaded.interactionCount) })) : null] })] }), session.loaded && snapshot.capabilities.closeSession ? (_jsxs("button", { className: "paui-icon-button", type: "button", disabled: loading ||
+                                        session.loaded.phase === "running" ||
+                                        session.loaded.phase === "cancelling" ||
+                                        session.loaded.interactionCount > 0, title: labels.closeSession, onClick: () => void closeSession(session.sessionId), children: [_jsx(CloseIcon, {}), _jsx("span", { className: "paui-sr-only", children: labels.closeSession })] })) : snapshot.capabilities.deleteSession &&
                                     session.sessionId !== snapshot.sessionId ? (_jsxs("button", { className: "paui-icon-button", type: "button", title: labels.deleteSession, onClick: () => {
                                         if (window.confirm(labels.confirmDeleteSession(session.title ?? labels.sessionUntitled)))
                                             void controller
@@ -786,12 +918,40 @@ function SessionDrawer({ controller, snapshot, labels, onClose, }) {
                                                 : String(reason)));
                                     }, children: [_jsx(TrashIcon, {}), _jsx("span", { className: "paui-sr-only", children: labels.deleteSession })] })) : null] }, session.sessionId))), snapshot.sessions?.nextCursor ? (_jsx("button", { className: "paui-load-more", type: "button", disabled: loading, onClick: () => void loadMore(snapshot.sessions?.nextCursor), children: labels.loadMore })) : null, error ? (_jsx("span", { className: "paui-error-text", role: "alert", children: error })) : null] })] }) }));
 }
+function mergeDrawerSessions(snapshot) {
+    const catalog = new Map((snapshot.sessions?.sessions ?? []).map((session) => [
+        session.sessionId,
+        session,
+    ]));
+    const loadedIds = new Set(snapshot.loadedSessions.map((session) => session.sessionId));
+    return [
+        ...snapshot.loadedSessions.map((session) => ({
+            ...catalog.get(session.sessionId),
+            ...session,
+            loaded: session,
+        })),
+        ...(snapshot.sessions?.sessions ?? []).filter((session) => !loadedIds.has(session.sessionId)),
+    ];
+}
 function activeElementFor(element) {
     const root = element?.getRootNode();
     if (root instanceof Document || root instanceof ShadowRoot) {
         return root.activeElement;
     }
     return document.activeElement;
+}
+function formatRawToolValue(value) {
+    const rendered = typeof value === "string"
+        ? value
+        : (() => {
+            try {
+                return JSON.stringify(value, null, 2) ?? String(value);
+            }
+            catch {
+                return String(value);
+            }
+        })();
+    return rendered.slice(0, 100_000);
 }
 const markdown = new Marked({ gfm: true, breaks: true });
 const FOCUSABLE_SELECTOR = 'a[href], button, input, select, textarea, [tabindex]:not([tabindex="-1"])';
@@ -848,6 +1008,13 @@ function controllerKey(controller) {
     const key = ++controllerKeyCounter;
     controllerKeys.set(controller, key);
     return key;
+}
+function sessionCacheKey(snapshot) {
+    if (!snapshot.sessionId)
+        return undefined;
+    return snapshot.sessionInstanceId
+        ? `${snapshot.sessionId}\u0000${snapshot.sessionInstanceId}`
+        : snapshot.sessionId;
 }
 function subscribeOnAnimationFrame(controller, listener) {
     if (typeof globalThis.requestAnimationFrame !== "function") {

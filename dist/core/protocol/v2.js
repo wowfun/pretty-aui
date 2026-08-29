@@ -108,7 +108,8 @@ class V2Driver {
     host;
     markClosed;
     version = 2;
-    #pendingTurn;
+    #pendingTurns = new Map();
+    #cancelledSessions = new Set();
     constructor(connection, initialized, host, markClosed) {
         this.connection = connection;
         this.initialized = initialized;
@@ -157,9 +158,12 @@ class V2Driver {
             sessionId,
         });
     }
+    promptReady(sessionId) {
+        return !this.#cancelledSessions.has(sessionId);
+    }
     async prompt(sessionId, prompt, onAccepted) {
-        if (this.#pendingTurn) {
-            throw new PrettyAuiError("SESSION_BUSY", "Only one foreground turn is supported", { protocol: 2 });
+        if (this.#pendingTurns.has(sessionId)) {
+            throw new PrettyAuiError("SESSION_BUSY", `Session '${sessionId}' already has a foreground turn`, { protocol: 2 });
         }
         let resolve;
         let reject;
@@ -167,38 +171,47 @@ class V2Driver {
             resolve = resolvePromise;
             reject = rejectPromise;
         });
-        this.#pendingTurn = {
+        const pendingTurn = {
             sessionId,
             accepted: false,
             promise,
             resolve,
             reject,
         };
+        this.#pendingTurns.set(sessionId, pendingTurn);
         try {
             const acknowledgement = this.connection.agent.request(acp.methods.agent.session.prompt, {
                 sessionId,
                 prompt: prompt,
             });
-            if (this.#pendingTurn)
-                this.#pendingTurn.accepted = true;
+            if (this.#pendingTurns.get(sessionId) === pendingTurn)
+                pendingTurn.accepted = true;
             onAccepted();
             await acknowledgement;
             return await promise;
         }
         catch (error) {
-            if (this.#pendingTurn?.promise === promise)
-                this.#pendingTurn = undefined;
+            if (this.#pendingTurns.get(sessionId) === pendingTurn)
+                this.#pendingTurns.delete(sessionId);
             throw error;
         }
     }
     async cancel(sessionId) {
-        await this.connection.agent.notify(acp.methods.agent.session.cancel, {
-            sessionId,
-        });
-        const pending = this.#pendingTurn;
-        if (!pending || pending.sessionId !== sessionId)
+        const pending = this.#pendingTurns.get(sessionId);
+        if (pending)
+            this.#cancelledSessions.add(sessionId);
+        try {
+            await this.connection.agent.notify(acp.methods.agent.session.cancel, {
+                sessionId,
+            });
+        }
+        catch (error) {
+            this.#cancelledSessions.delete(sessionId);
+            throw error;
+        }
+        if (!pending || this.#pendingTurns.get(sessionId) !== pending)
             return;
-        this.#pendingTurn = undefined;
+        this.#pendingTurns.delete(sessionId);
         pending.resolve("cancelled");
     }
     async setConfigOption(sessionId, id, value) {
@@ -226,28 +239,32 @@ class V2Driver {
         await this.connection.agent.request(acp.methods.agent.auth.logout, {});
     }
     handleUpdate(sessionId, update) {
-        if (!this.#pendingTurn ||
-            this.#pendingTurn.sessionId !== sessionId ||
-            !isRecord(update))
+        if (!isRecord(update))
             return;
         if (update.sessionUpdate !== "state_update" || update.state !== "idle")
             return;
-        const pending = this.#pendingTurn;
-        this.#pendingTurn = undefined;
+        if (this.#cancelledSessions.delete(sessionId))
+            return;
+        if (!this.#pendingTurns.has(sessionId))
+            return;
+        const pending = this.#pendingTurns.get(sessionId);
+        if (!pending)
+            return;
+        this.#pendingTurns.delete(sessionId);
         pending.resolve(asString(update.stopReason) ?? "end_turn");
     }
     handleClose() {
-        if (!this.#pendingTurn)
-            return;
-        const pending = this.#pendingTurn;
-        this.#pendingTurn = undefined;
-        pending.reject(new PrettyAuiError("TURN_INTERRUPTED", "Connection closed before the turn completed", {
-            protocol: 2,
-            phase: "prompt",
-            retryable: true,
-            accepted: pending.accepted,
-            completionUnknown: pending.accepted,
-        }));
+        for (const pending of this.#pendingTurns.values()) {
+            pending.reject(new PrettyAuiError("TURN_INTERRUPTED", "Connection closed before the turn completed", {
+                protocol: 2,
+                phase: "prompt",
+                retryable: true,
+                accepted: pending.accepted,
+                completionUnknown: pending.accepted,
+            }));
+        }
+        this.#pendingTurns.clear();
+        this.#cancelledSessions.clear();
     }
     async close(error) {
         this.markClosed();

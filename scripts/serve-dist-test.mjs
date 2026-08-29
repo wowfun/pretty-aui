@@ -28,6 +28,12 @@ const server = createServer(async (request, response) => {
     response.writeHead(200, {
       "Content-Type": contentType(path),
       "Cache-Control": "no-store",
+      ...(pathname === "/"
+        ? {
+            "Content-Security-Policy":
+              "default-src 'none'; script-src 'self' 'nonce-pretty-aui-test'; style-src 'nonce-pretty-aui-test'; img-src data:; media-src data:",
+          }
+        : {}),
     });
     const stream = createReadStream(path);
     stream.on("error", (error) => response.destroy(error));

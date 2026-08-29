@@ -1,6 +1,5 @@
-import { copyFile, mkdir } from "node:fs/promises";
-import { join } from "node:path";
-import { bundledPackages } from "./bundled-packages.mjs";
+import { copyFile, mkdir, rm, writeFile } from "node:fs/promises";
+import { bundledLicenseText } from "./bundled-packages.mjs";
 
 const dist = new URL("../dist/", import.meta.url);
 await mkdir(dist, { recursive: true });
@@ -14,15 +13,13 @@ await copyFile(
 );
 
 const standalone = new URL("standalone/", dist);
-const licenses = new URL("licenses/", standalone);
-await mkdir(licenses, { recursive: true });
 await copyFile(
   new URL("../LICENSE", import.meta.url),
   new URL("LICENSE", standalone),
 );
-for (const bundledPackage of await bundledPackages(standalone)) {
-  await copyFile(
-    join(bundledPackage.root, "LICENSE"),
-    new URL(bundledPackage.outputName, licenses),
-  );
-}
+await rm(new URL("licenses/", standalone), { recursive: true, force: true });
+await writeFile(
+  new URL("THIRD_PARTY_LICENSES.txt", standalone),
+  await bundledLicenseText(standalone),
+  "utf8",
+);

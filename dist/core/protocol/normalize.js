@@ -193,6 +193,7 @@ export class TimelineStore {
     #counter = 0;
     #lastAnonymousMessage = new Map();
     #pendingUserId;
+    #pendingContextIds = new Set();
     #terminalState = new Map();
     get activities() {
         return this.#activities;
@@ -201,10 +202,12 @@ export class TimelineStore {
         this.#activities = [];
         this.#lastAnonymousMessage.clear();
         this.#pendingUserId = undefined;
+        this.#pendingContextIds.clear();
         this.#terminalState.clear();
     }
     beginTurn() {
         this.#lastAnonymousMessage.clear();
+        this.#pendingContextIds.clear();
     }
     addUserMessage(content, pending) {
         const id = `local-user-${++this.#counter}`;
@@ -219,10 +222,21 @@ export class TimelineStore {
             this.#pendingUserId = id;
         return id;
     }
-    markUserAccepted() {
+    markUserAccepted(contextItems = []) {
         if (!this.#pendingUserId)
             return;
         this.#replace(this.#pendingUserId, (activity) => activity.type === "message" ? { ...activity, pending: false } : activity);
+        for (const item of contextItems) {
+            const activity = {
+                type: "context",
+                id: `local-context-${++this.#counter}`,
+                contextId: item.id,
+                label: item.label,
+                content: item.content,
+            };
+            this.#appendActivity(activity);
+        }
+        this.#pendingContextIds = new Set(contextItems.map((item) => item.id));
     }
     reduce(update, protocol) {
         if (!isRecord(update) || typeof update.sessionUpdate !== "string") {
@@ -305,6 +319,11 @@ export class TimelineStore {
         }
     }
     #appendMessage(role, messageId, content, protocol) {
+        if (role === "user" &&
+            this.#pendingUserId &&
+            isSubmittedContextBlock(content, this.#pendingContextIds)) {
+            return;
+        }
         let wireId = messageId;
         if (!wireId && protocol === 1) {
             wireId =
@@ -320,6 +339,7 @@ export class TimelineStore {
             if (existing?.type === "message") {
                 this.#replace(pendingId, () => ({ ...existing, id, pending: false }));
                 this.#pendingUserId = undefined;
+                this.#pendingContextIds.clear();
             }
         }
         const existing = this.#activities.find((item) => item.type === "message" && item.id === id);
@@ -345,7 +365,7 @@ export class TimelineStore {
             const pending = this.#activities.find((item) => item.type === "message" && item.id === pendingId);
             if (pending?.type === "message") {
                 const content = Object.hasOwn(update, "content")
-                    ? normalizeContent(update.content)
+                    ? normalizeUserEcho(update.content, this.#pendingContextIds)
                     : pending.content;
                 this.#replace(pendingId, () => ({
                     ...pending,
@@ -354,6 +374,7 @@ export class TimelineStore {
                     pending: false,
                 }));
                 this.#pendingUserId = undefined;
+                this.#pendingContextIds.clear();
                 return;
             }
         }
@@ -560,6 +581,20 @@ export class TimelineStore {
             }
         }
     }
+}
+function normalizeUserEcho(value, contextIds) {
+    if (!Array.isArray(value))
+        return [];
+    return normalizeContent(value.filter((block) => !isSubmittedContextBlock(block, contextIds)));
+}
+function isSubmittedContextBlock(value, contextIds) {
+    if (!isRecord(value) || !isRecord(value._meta))
+        return false;
+    const marker = value._meta["pretty-aui/context"];
+    return (isRecord(marker) &&
+        marker.version === 1 &&
+        typeof marker.id === "string" &&
+        contextIds.has(marker.id));
 }
 function messageActivityId(role, wireId) {
     return `message:${role}:${wireId}`;

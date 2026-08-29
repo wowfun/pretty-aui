@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { access, readFile, readdir } from "node:fs/promises";
-import { bundledPackages } from "./bundled-packages.mjs";
+import { bundledLicenseText } from "./bundled-packages.mjs";
 
 const dist = new URL("../dist/", import.meta.url);
 const expectedModules = [
@@ -42,16 +42,17 @@ const expectedModules = [
   "standalone/chunks/v2.js",
   "standalone/chunks/v2.js.map",
   "standalone/LICENSE",
+  "standalone/THIRD_PARTY_LICENSES.txt",
 ];
-
-const bundled = await bundledPackages(new URL("standalone/", dist));
-expectedModules.push(
-  ...bundled.map(({ outputName }) => `standalone/licenses/${outputName}`),
-);
 
 await Promise.all(expectedModules.map((path) => access(new URL(path, dist))));
 await assertMissing("chunks");
 await assertMissing("standalone.js");
+await assertMissing("standalone/licenses");
+assert.equal(
+  await readFile(new URL("standalone/THIRD_PARTY_LICENSES.txt", dist), "utf8"),
+  await bundledLicenseText(new URL("standalone/", dist)),
+);
 
 const [
   indexSource,

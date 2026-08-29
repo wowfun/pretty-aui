@@ -28,7 +28,11 @@ export declare class TimelineStore {
     reset(): void;
     beginTurn(): void;
     addUserMessage(content: readonly ContentBlock[], pending: boolean): string;
-    markUserAccepted(): void;
+    markUserAccepted(contextItems?: readonly {
+        readonly id: string;
+        readonly label: string;
+        readonly content: readonly ContentBlock[];
+    }[]): void;
     reduce(update: unknown, protocol: 1 | 2): ReducerEffect;
 }
 //# sourceMappingURL=normalize.d.ts.map

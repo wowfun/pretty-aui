@@ -34,10 +34,40 @@ export async function bundledPackages(standaloneDirectory) {
         version: String(manifest.version ?? "UNKNOWN"),
         root,
         license,
-        outputName: `${safeSegment(name)}-${safeSegment(license)}.txt`,
       };
     }),
   );
+}
+
+export async function bundledLicenseText(standaloneDirectory) {
+  const rule = "=".repeat(80);
+  const sectionRule = "-".repeat(80);
+  const sections = await Promise.all(
+    (await bundledPackages(standaloneDirectory)).map(
+      async ({ name, version, root, license }) => {
+        const licenseText = (
+          await readFile(join(root, "LICENSE"), "utf8")
+        ).trimEnd();
+        return [
+          rule,
+          `${name} ${version}`,
+          `Declared license: ${license}`,
+          "Included upstream file: LICENSE",
+          sectionRule,
+          licenseText,
+        ].join("\n");
+      },
+    ),
+  );
+  return [
+    "pretty-aui standalone third-party licenses",
+    "",
+    "Generated from the dependencies embedded in the standalone browser bundle.",
+    "Retain this file with redistributed copies of that bundle.",
+    "",
+    ...sections,
+    "",
+  ].join("\n");
 }
 
 async function sourceMapFiles(directory) {
@@ -99,8 +129,4 @@ async function findPackageRoot(packageName, resolvers) {
     }
   }
   return undefined;
-}
-
-function safeSegment(value) {
-  return value.replace(/^@/, "").replaceAll(/[^a-zA-Z0-9.-]+/g, "-");
 }

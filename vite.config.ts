@@ -24,6 +24,8 @@ export default defineConfig({
     },
     rollupOptions: {
       output: {
+        banner:
+          "globalThis.__zod_globalConfig ??= {}; globalThis.__zod_globalConfig.jitless = true;",
         chunkFileNames: "chunks/[name].js",
         assetFileNames: "assets/[name][extname]",
       },

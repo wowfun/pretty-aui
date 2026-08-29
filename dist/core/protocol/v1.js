@@ -123,7 +123,7 @@ class V1Driver {
     host;
     markClosed;
     version = 1;
-    #modeOnly = false;
+    #modeOnly = new Map();
     constructor(connection, initialized, sink, host, markClosed) {
         this.connection = connection;
         this.initialized = initialized;
@@ -134,7 +134,7 @@ class V1Driver {
     async newSession(options) {
         validateSessionOptions(options, this.initialized, 1, "session/new");
         const response = await requestSessionWithAuthMapping(() => this.connection.agent.request(acp.methods.agent.session.new, toV1SessionRequest(options)), 1, "session/new");
-        this.#modeOnly = !response.configOptions?.length && Boolean(response.modes);
+        this.#modeOnly.set(response.sessionId, !response.configOptions?.length && Boolean(response.modes));
         return sessionFromResponse(response.sessionId, response.configOptions, response.modes);
     }
     async openSession(sessionId, options, history) {
@@ -142,6 +142,7 @@ class V1Driver {
         const request = { ...toV1SessionRequest(options), sessionId };
         if (history === "all" && this.initialized.capabilities.loadSession) {
             const response = await requestSessionWithAuthMapping(() => this.connection.agent.request(acp.methods.agent.session.load, request), 1, "session/open");
+            this.#modeOnly.set(sessionId, !response.configOptions?.length && Boolean(response.modes));
             return sessionFromResponse(sessionId, response.configOptions, response.modes);
         }
         if (!this.initialized.capabilities.resumeSession) {
@@ -151,6 +152,7 @@ class V1Driver {
             });
         }
         const response = await requestSessionWithAuthMapping(() => this.connection.agent.request(acp.methods.agent.session.resume, request), 1, "session/open");
+        this.#modeOnly.set(sessionId, !response.configOptions?.length && Boolean(response.modes));
         return sessionFromResponse(sessionId, response.configOptions, response.modes, history === "all");
     }
     async listSessions(cwd, cursor) {
@@ -170,13 +172,20 @@ class V1Driver {
         await this.connection.agent.request(acp.methods.agent.session.delete, {
             sessionId,
         });
+        this.#modeOnly.delete(sessionId);
     }
     async closeSession(sessionId) {
-        if (!this.initialized.capabilities.closeSession)
+        if (!this.initialized.capabilities.closeSession) {
+            this.#modeOnly.delete(sessionId);
             return;
+        }
         await this.connection.agent.request(acp.methods.agent.session.close, {
             sessionId,
         });
+        this.#modeOnly.delete(sessionId);
+    }
+    promptReady(_sessionId) {
+        return true;
     }
     async prompt(sessionId, prompt, onAccepted) {
         const pending = this.connection.agent.request(acp.methods.agent.session.prompt, {
@@ -193,7 +202,9 @@ class V1Driver {
         });
     }
     async setConfigOption(sessionId, id, value) {
-        if (this.#modeOnly && id === "mode" && typeof value === "string") {
+        if (this.#modeOnly.get(sessionId) &&
+            id === "mode" &&
+            typeof value === "string") {
             await this.connection.agent.request(acp.methods.agent.session.setMode, {
                 sessionId,
                 modeId: value,
@@ -222,9 +233,11 @@ class V1Driver {
     }
     async logout() {
         await this.connection.agent.request(acp.methods.agent.logout, {});
+        this.#modeOnly.clear();
     }
     async close(error) {
         this.markClosed();
+        this.#modeOnly.clear();
         this.connection.close(error);
         await this.connection.closed;
     }

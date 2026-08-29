@@ -7,6 +7,7 @@ import type {
   StreamableHttpConnectorOptions,
   WebSocketConnectorOptions,
 } from "./types.js";
+import { wireMessageWithinBudget } from "./wire-budget.js";
 
 /**
  * Creates an ACP connector backed by the SDK Streamable HTTP transport.
@@ -45,7 +46,10 @@ export function createWebSocketConnector(
   return {
     open({ signal }) {
       const stream = createWebSocketStream(url, {
-        ...(options.protocols ? { protocols: [...options.protocols] } : {}),
+        // The SDK always passes its protocols value as WebSocket's second
+        // argument. Native browsers stringify an explicit `undefined` to the
+        // bogus subprotocol "undefined"; an empty list omits the header.
+        protocols: [...(options.protocols ?? [])],
         ...(options.headers ? { headers: { ...options.headers } } : {}),
         ...(options.cookies ? { cookies: options.cookies } : {}),
         ...(options.WebSocket ? { WebSocket: options.WebSocket as never } : {}),
@@ -161,6 +165,13 @@ function bindLifetime(
   const writable = new WritableStream<unknown>({
     write(message) {
       if (stopped) throw new Error("ACP transport lifetime has ended");
+      if (!wireMessageWithinBudget(message)) {
+        throw new PrettyAuiError(
+          "PROTOCOL_VIOLATION",
+          "ACP wire message exceeded the 2 MiB decoded output limit",
+          { phase: "transport/output" },
+        );
+      }
       return writer.write(message);
     },
     async close() {
@@ -201,59 +212,4 @@ function requestUrlOf(input: RequestInfo | URL, fallback: URL): URL {
 
 function isRedirect(status: number): boolean {
   return status >= 300 && status <= 399;
-}
-
-function wireMessageWithinBudget(value: unknown): boolean {
-  let bytes = 0;
-  let nodes = 0;
-  const seen = new WeakSet<object>();
-  const pending: { value: unknown; depth: number }[] = [{ value, depth: 0 }];
-  while (pending.length) {
-    const current = pending.pop();
-    if (!current) break;
-    nodes += 1;
-    if (nodes > 32_768 || current.depth > 64) return false;
-    if (typeof current.value === "string") {
-      bytes += utf8ByteLength(current.value, 2 * 1024 * 1024 - bytes);
-    } else if (typeof current.value === "number") {
-      bytes += 8;
-    } else if (current.value !== null && typeof current.value === "object") {
-      if (seen.has(current.value)) return false;
-      seen.add(current.value);
-      if (Array.isArray(current.value)) {
-        for (const item of current.value)
-          pending.push({ value: item, depth: current.depth + 1 });
-      } else {
-        for (const [key, item] of Object.entries(current.value)) {
-          bytes += utf8ByteLength(key, 2 * 1024 * 1024 - bytes);
-          pending.push({ value: item, depth: current.depth + 1 });
-        }
-      }
-    }
-    if (bytes > 2 * 1024 * 1024) return false;
-  }
-  return true;
-}
-
-function utf8ByteLength(value: string, remaining: number): number {
-  let bytes = 0;
-  for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index);
-    if (code <= 0x7f) bytes += 1;
-    else if (code <= 0x7ff) bytes += 2;
-    else if (
-      code >= 0xd800 &&
-      code <= 0xdbff &&
-      index + 1 < value.length &&
-      value.charCodeAt(index + 1) >= 0xdc00 &&
-      value.charCodeAt(index + 1) <= 0xdfff
-    ) {
-      bytes += 4;
-      index += 1;
-    } else {
-      bytes += 3;
-    }
-    if (bytes > remaining) return bytes;
-  }
-  return bytes;
 }

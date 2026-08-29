@@ -163,15 +163,17 @@ export async function connectV2(
 
 class V2Driver implements ProtocolDriver {
   readonly version = 2 as const;
-  #pendingTurn:
-    | {
-        readonly sessionId: string;
-        accepted: boolean;
-        readonly promise: Promise<string>;
-        readonly resolve: (stopReason: string) => void;
-        readonly reject: (error: unknown) => void;
-      }
-    | undefined;
+  readonly #pendingTurns = new Map<
+    string,
+    {
+      readonly sessionId: string;
+      accepted: boolean;
+      readonly promise: Promise<string>;
+      readonly resolve: (stopReason: string) => void;
+      readonly reject: (error: unknown) => void;
+    }
+  >();
+  readonly #cancelledSessions = new Set<string>();
 
   constructor(
     private readonly connection: acp.ClientConnection,
@@ -251,15 +253,19 @@ class V2Driver implements ProtocolDriver {
     });
   }
 
+  promptReady(sessionId: string): boolean {
+    return !this.#cancelledSessions.has(sessionId);
+  }
+
   async prompt(
     sessionId: string,
     prompt: readonly ContentBlock[],
     onAccepted: () => void,
   ): Promise<string> {
-    if (this.#pendingTurn) {
+    if (this.#pendingTurns.has(sessionId)) {
       throw new PrettyAuiError(
         "SESSION_BUSY",
-        "Only one foreground turn is supported",
+        `Session '${sessionId}' already has a foreground turn`,
         { protocol: 2 },
       );
     }
@@ -269,13 +275,14 @@ class V2Driver implements ProtocolDriver {
       resolve = resolvePromise;
       reject = rejectPromise;
     });
-    this.#pendingTurn = {
+    const pendingTurn = {
       sessionId,
       accepted: false,
       promise,
       resolve,
       reject,
     };
+    this.#pendingTurns.set(sessionId, pendingTurn);
     try {
       const acknowledgement = this.connection.agent.request(
         acp.methods.agent.session.prompt,
@@ -284,23 +291,31 @@ class V2Driver implements ProtocolDriver {
           prompt: prompt as acp.ContentBlock[],
         },
       );
-      if (this.#pendingTurn) this.#pendingTurn.accepted = true;
+      if (this.#pendingTurns.get(sessionId) === pendingTurn)
+        pendingTurn.accepted = true;
       onAccepted();
       await acknowledgement;
       return await promise;
     } catch (error) {
-      if (this.#pendingTurn?.promise === promise) this.#pendingTurn = undefined;
+      if (this.#pendingTurns.get(sessionId) === pendingTurn)
+        this.#pendingTurns.delete(sessionId);
       throw error;
     }
   }
 
   async cancel(sessionId: string): Promise<void> {
-    await this.connection.agent.notify(acp.methods.agent.session.cancel, {
-      sessionId,
-    });
-    const pending = this.#pendingTurn;
-    if (!pending || pending.sessionId !== sessionId) return;
-    this.#pendingTurn = undefined;
+    const pending = this.#pendingTurns.get(sessionId);
+    if (pending) this.#cancelledSessions.add(sessionId);
+    try {
+      await this.connection.agent.notify(acp.methods.agent.session.cancel, {
+        sessionId,
+      });
+    } catch (error) {
+      this.#cancelledSessions.delete(sessionId);
+      throw error;
+    }
+    if (!pending || this.#pendingTurns.get(sessionId) !== pending) return;
+    this.#pendingTurns.delete(sessionId);
     pending.resolve("cancelled");
   }
 
@@ -343,36 +358,35 @@ class V2Driver implements ProtocolDriver {
   }
 
   handleUpdate(sessionId: string, update: unknown): void {
-    if (
-      !this.#pendingTurn ||
-      this.#pendingTurn.sessionId !== sessionId ||
-      !isRecord(update)
-    )
-      return;
+    if (!isRecord(update)) return;
     if (update.sessionUpdate !== "state_update" || update.state !== "idle")
       return;
-    const pending = this.#pendingTurn;
-    this.#pendingTurn = undefined;
+    if (this.#cancelledSessions.delete(sessionId)) return;
+    if (!this.#pendingTurns.has(sessionId)) return;
+    const pending = this.#pendingTurns.get(sessionId);
+    if (!pending) return;
+    this.#pendingTurns.delete(sessionId);
     pending.resolve(asString(update.stopReason) ?? "end_turn");
   }
 
   handleClose(): void {
-    if (!this.#pendingTurn) return;
-    const pending = this.#pendingTurn;
-    this.#pendingTurn = undefined;
-    pending.reject(
-      new PrettyAuiError(
-        "TURN_INTERRUPTED",
-        "Connection closed before the turn completed",
-        {
-          protocol: 2,
-          phase: "prompt",
-          retryable: true,
-          accepted: pending.accepted,
-          completionUnknown: pending.accepted,
-        },
-      ),
-    );
+    for (const pending of this.#pendingTurns.values()) {
+      pending.reject(
+        new PrettyAuiError(
+          "TURN_INTERRUPTED",
+          "Connection closed before the turn completed",
+          {
+            protocol: 2,
+            phase: "prompt",
+            retryable: true,
+            accepted: pending.accepted,
+            completionUnknown: pending.accepted,
+          },
+        ),
+      );
+    }
+    this.#pendingTurns.clear();
+    this.#cancelledSessions.clear();
   }
 
   async close(error?: unknown): Promise<void> {

@@ -1,12 +1,18 @@
 import { PrettyAuiError, toChatError } from "./errors.js";
 import { connectProtocol } from "./protocol/connect.js";
-import { TimelineStore, type ReducerEffect } from "./protocol/normalize.js";
+import {
+  boundedRecord,
+  isRecord,
+  TimelineStore,
+  type ReducerEffect,
+} from "./protocol/normalize.js";
 import type {
   ProtocolDriver,
   ProtocolSession,
   ProtocolSink,
 } from "./protocol/types.js";
 import { validatePrompt } from "./protocol/types.js";
+import { wireMessageWithinBudget } from "./wire-budget.js";
 import type {
   AuthMethod,
   ChatCapabilities,
@@ -15,10 +21,13 @@ import type {
   ChatInput,
   ChatInteraction,
   ChatOptions,
+  ChatSessionPhase,
   ChatSnapshot,
   ChatTurnHandle,
   ContentBlock,
   ContextItem,
+  ContextProvider,
+  ContextSelectionItem,
   ElicitationDecision,
   ElicitationInteraction,
   PermissionDecision,
@@ -36,15 +45,35 @@ const NO_CAPABILITIES: ChatCapabilities = {
 };
 
 interface PendingInteraction<Decision> {
+  readonly sessionId?: string;
   readonly interaction: ChatInteraction;
   readonly resolve: (decision: Decision) => void;
 }
 
 interface ActiveTurn {
   readonly id: string;
+  readonly sessionId: string;
   readonly abort: AbortController;
+  readonly contextSelection: readonly ContextSelectionItem[];
   cancelled: boolean;
   submitted: boolean;
+}
+
+interface ManagedSession {
+  readonly sessionId: string;
+  readonly instanceId: string;
+  readonly timeline: TimelineStore;
+  phase: ChatSessionPhase;
+  activeTurn: ActiveTurn | undefined;
+  configOptions: ChatSnapshot["configOptions"];
+  commands: ChatSnapshot["commands"];
+  interactions: ChatSnapshot["interactions"];
+  sessionTitle: string | undefined;
+  historyGap: boolean;
+  usage: ChatSnapshot["usage"];
+  stopReason: string | undefined;
+  error: ChatSnapshot["error"];
+  lastSelected: number;
 }
 
 interface StagingSession {
@@ -69,7 +98,11 @@ class DefaultChatController implements ChatController, ProtocolSink {
   readonly ready: Promise<void>;
   readonly #options: ChatOptions;
   readonly #listeners = new Set<() => void>();
-  #timeline = new TimelineStore();
+  #contextUnsubscribe: (() => void) | undefined;
+  #contextMutation: symbol | undefined;
+  #contextSelection: readonly ContextSelectionItem[];
+  readonly #sessions = new Map<string, ManagedSession>();
+  readonly #staging = new Map<string, StagingSession>();
   #connectionAbort: AbortController | undefined;
   readonly #permissions = new Map<
     string,
@@ -79,31 +112,53 @@ class DefaultChatController implements ChatController, ProtocolSink {
     string,
     PendingInteraction<ElicitationDecision>
   >();
+  #connectionInteractions: ChatSnapshot["interactions"] = [];
   #driver: ProtocolDriver | undefined;
   #snapshot: ChatSnapshot;
-  #activeTurn: ActiveTurn | undefined;
-  #staging: StagingSession | undefined;
   #counter = 0;
+  #selectionCounter = 0;
+  #sessionInstanceCounter = 0;
+  #selectionRequest = 0;
   #destroyed = false;
   #connecting: Promise<void> | undefined;
   #connectionGeneration = 0;
-  #sessionMutation: symbol | undefined;
-  #sessionListRequest: symbol | undefined;
+  #connectionPhase:
+    "connecting" | "ready" | "auth_required" | "error" | "closed" =
+    "connecting";
+  #connectionError: ChatSnapshot["error"];
+  #sessionTrail: ChatSnapshot["sessionTrail"] = [];
+  #newSessionMutation: symbol | undefined;
+  readonly #sessionMutations = new Map<string, symbol>();
+  #sessionListRequest:
+    | {
+        readonly cursor: string | undefined;
+        readonly operation: Promise<SessionPage>;
+        readonly token: symbol;
+      }
+    | undefined;
 
   constructor(options: ChatOptions) {
     this.#options = options;
+    this.#contextSelection = readContextSelection(options.context);
     this.#snapshot = {
       phase: "connecting",
+      loadedSessions: [],
       historyGap: false,
       activities: [],
-      contextItems: [],
       configOptions: [],
       commands: [],
+      contextSelection: this.#contextProjection(),
       interactions: [],
       authMethods: [],
       capabilities: NO_CAPABILITIES,
       sessionTrail: [],
     };
+    if (isContextProvider(options.context)) {
+      this.#contextUnsubscribe = options.context.subscribe(() => {
+        if (this.#destroyed) return;
+        this.#syncContextSelection();
+      });
+    }
     this.ready = this.#connect(true);
     void this.ready.catch(() => undefined);
   }
@@ -119,11 +174,15 @@ class DefaultChatController implements ChatController, ProtocolSink {
 
   send(input: ChatInput): ChatTurnHandle {
     this.#assertUsableSession();
-    if (
-      this.#activeTurn ||
-      this.#snapshot.phase === "running" ||
-      this.#snapshot.phase === "cancelling"
-    ) {
+    const session = this.#requireSession();
+    if (this.#sessionMutations.has(session.sessionId)) {
+      throw new PrettyAuiError(
+        "SESSION_BUSY",
+        `Wait for the current operation on session '${session.sessionId}'`,
+        { protocol: this.#driver?.version, phase: "prompt" },
+      );
+    }
+    if (session.activeTurn) {
       throw new PrettyAuiError(
         "SESSION_BUSY",
         "Wait for the current turn to finish",
@@ -133,7 +192,31 @@ class DefaultChatController implements ChatController, ProtocolSink {
         },
       );
     }
+    if (
+      session.phase !== "idle" ||
+      !this.#requireDriver().promptReady(session.sessionId)
+    ) {
+      throw new PrettyAuiError(
+        "SESSION_BUSY",
+        `Session '${session.sessionId}' is not ready for another prompt`,
+        { protocol: this.#driver?.version, phase: "prompt" },
+      );
+    }
     const blocks = normalizeInput(input);
+    if (
+      blocks.some(
+        (block) =>
+          block._meta !== null &&
+          block._meta !== undefined &&
+          Object.hasOwn(block._meta, "pretty-aui/context"),
+      )
+    ) {
+      throw new PrettyAuiError(
+        "INVALID_CONFIGURATION",
+        "Prompt input cannot use the reserved pretty-aui/context metadata key",
+        { phase: "prompt" },
+      );
+    }
     if (
       !blocks.length ||
       blocks.every(
@@ -158,42 +241,74 @@ class DefaultChatController implements ChatController, ProtocolSink {
     const abort = new AbortController();
     const turn: ActiveTurn = {
       id: turnId,
+      sessionId: session.sessionId,
       abort,
+      contextSelection: this.#contextSelection,
       cancelled: false,
       submitted: false,
     };
-    this.#activeTurn = turn;
-    this.#timeline.beginTurn();
-    this.#timeline.addUserMessage(blocks, true);
-    this.#setSnapshot({
-      phase: "running",
-      activities: this.#timeline.activities,
-      stopReason: undefined,
-      error: undefined,
-    });
-    this.#emit({ type: "turn_started", turnId });
+    session.activeTurn = turn;
+    session.timeline.beginTurn();
+    session.timeline.addUserMessage(blocks, true);
+    session.phase = "running";
+    session.stopReason = undefined;
+    session.error = undefined;
+    this.#refreshSession(session, true);
+    this.#emit({ type: "turn_started", sessionId: session.sessionId, turnId });
     const done = this.#runTurn(turn, blocks);
     void done.catch(() => undefined);
     return { id: turnId, done };
   }
 
-  async cancel(): Promise<void> {
-    const turn = this.#activeTurn;
+  async addContext(): Promise<void> {
+    const provider = this.#contextProvider("add");
+    if (!provider.add) {
+      throw new PrettyAuiError(
+        "METHOD_NOT_AVAILABLE",
+        "The context provider does not support adding context",
+        { phase: "context/add" },
+      );
+    }
+    await this.#mutateContext("context/add", () => provider.add!());
+  }
+
+  async removeContext(id: string): Promise<void> {
+    const provider = this.#contextProvider("remove");
+    if (!provider.remove) {
+      throw new PrettyAuiError(
+        "METHOD_NOT_AVAILABLE",
+        "The context provider does not support removing context",
+        { phase: "context/remove" },
+      );
+    }
+    if (!this.#contextSelection.some((item) => item.id === id)) {
+      throw new PrettyAuiError(
+        "INVALID_CONFIGURATION",
+        `Unknown context selection '${id}'`,
+        { phase: "context/remove" },
+      );
+    }
+    await this.#mutateContext("context/remove", () => provider.remove!(id));
+  }
+
+  async cancel(sessionId?: string): Promise<void> {
+    const session = this.#requireSession(sessionId);
+    const turn = session.activeTurn;
     if (!turn || turn.cancelled) return;
     turn.cancelled = true;
     turn.abort.abort(TURN_CANCELLED);
-    this.#resolveInteractions();
-    this.#setSnapshot({ phase: "cancelling" });
+    this.#resolveInteractions(session.sessionId);
+    session.phase = "cancelling";
+    this.#refreshSession(session, true);
     if (!turn.submitted) return;
-    const sessionId = this.#snapshot.sessionId;
     const driver = this.#driver;
-    if (sessionId && driver) {
+    if (driver) {
       try {
-        await driver.cancel(sessionId);
+        await driver.cancel(session.sessionId);
       } catch (error) {
-        if (this.#activeTurn === turn) {
+        if (session.activeTurn === turn) {
           turn.cancelled = false;
-          this.#fail(error);
+          this.#fail(error, session.sessionId);
         }
         throw error;
       }
@@ -201,23 +316,31 @@ class DefaultChatController implements ChatController, ProtocolSink {
   }
 
   async reconnect(): Promise<void> {
-    await this.#withSessionOperation("connection/reconnect", () =>
+    this.#assertConnectionReplaceable();
+    await this.#withNewSessionOperation("connection/reconnect", () =>
       this.#connect(false),
     );
   }
 
   async newSession(): Promise<void> {
-    await this.#withSessionMutation("session/new", async (driver) => {
-      const session = await driver.newSession(this.#options.session);
-      this.#assertDriverCurrent(driver);
-      this.#resolveInteractions();
-      this.#timeline.reset();
-      this.#applySession(session, this.#timeline);
-    });
+    this.#assertSessionCapacity();
+    try {
+      await this.#withNewSessionOperation("session/new", async () => {
+        const driver = this.#requireDriver();
+        const session = await driver.newSession(this.#options.session);
+        this.#assertDriverCurrent(driver);
+        const managed = this.#createSession(session);
+        this.#selectSession(managed);
+      });
+    } catch (error) {
+      throw this.#mapAuthenticationFailure(error, "session/new");
+    }
   }
 
   async listSessions(cursor?: string): Promise<SessionPage> {
-    if (this.#sessionListRequest) {
+    const active = this.#sessionListRequest;
+    if (active) {
+      if (active.cursor === cursor) return active.operation;
       throw new PrettyAuiError(
         "SESSION_BUSY",
         "Wait for the current session-list request to finish",
@@ -225,100 +348,129 @@ class DefaultChatController implements ChatController, ProtocolSink {
       );
     }
     const driver = this.#requireDriver();
-    const request = Symbol("session/list");
-    this.#sessionListRequest = request;
-    try {
-      const page = await driver.listSessions(this.#options.session.cwd, cursor);
-      this.#assertDriverCurrent(driver);
-      const sessions =
-        cursor && this.#snapshot.sessions
-          ? {
-              sessions: deduplicateSessions([
-                ...this.#snapshot.sessions.sessions,
-                ...page.sessions,
-              ]).slice(0, 1_000),
-              ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
-            }
-          : page;
-      this.#setSnapshot({ sessions });
-      return sessions;
-    } finally {
-      if (this.#sessionListRequest === request)
-        this.#sessionListRequest = undefined;
-    }
+    const token = Symbol("session/list");
+    const operation = Promise.resolve().then(async () => {
+      try {
+        const page = await driver.listSessions(
+          this.#options.session.cwd,
+          cursor,
+        );
+        this.#assertDriverCurrent(driver);
+        const sessions =
+          cursor && this.#snapshot.sessions
+            ? {
+                sessions: deduplicateSessions([
+                  ...this.#snapshot.sessions.sessions,
+                  ...page.sessions,
+                ]).slice(0, 1_000),
+                ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
+              }
+            : page;
+        this.#snapshot = cleanSnapshot({ ...this.#snapshot, sessions });
+        this.#publish();
+        return sessions;
+      } finally {
+        if (this.#sessionListRequest?.token === token)
+          this.#sessionListRequest = undefined;
+      }
+    });
+    this.#sessionListRequest = { cursor, operation, token };
+    return operation;
   }
 
   async openSession(sessionId: string): Promise<void> {
-    await this.#withSessionMutation("session/open", async (driver) => {
-      if (sessionId === this.#snapshot.sessionId) {
-        this.#setSnapshot({ sessionTrail: [] });
-        return;
-      }
-      await this.#openSession(driver, sessionId, []);
-    });
+    const request = ++this.#selectionRequest;
+    const loaded = this.#sessions.get(sessionId);
+    if (loaded) {
+      if (request === this.#selectionRequest) this.#selectSession(loaded);
+      return;
+    }
+    this.#assertSessionCapacity();
+    await this.#withTargetSessionOperation(
+      sessionId,
+      "session/open",
+      async () =>
+        this.#openSession(this.#requireDriver(), sessionId, [], request),
+    );
   }
 
   async openChildSession(sessionId: string): Promise<void> {
-    await this.#withSessionMutation("session/open-child", async (driver) => {
-      const currentSessionId = this.#snapshot.sessionId;
-      if (!currentSessionId) {
-        throw new PrettyAuiError("SESSION_NOT_READY", "No active session", {
-          phase: "session/open-child",
-        });
-      }
-      if (sessionId === currentSessionId) return;
-      const current: SessionInfo = {
-        sessionId: currentSessionId,
-        ...(this.#snapshot.sessionTitle
-          ? { title: this.#snapshot.sessionTitle }
-          : {}),
-      };
-      await this.#openSession(driver, sessionId, [
-        ...this.#snapshot.sessionTrail,
-        current,
-      ]);
-    });
+    const current = this.#requireSession();
+    this.#assertSessionIdle(current, "session/open-child");
+    if (sessionId === current.sessionId) return;
+    const trail = [
+      ...this.#snapshot.sessionTrail,
+      {
+        sessionId: current.sessionId,
+        ...(current.sessionTitle ? { title: current.sessionTitle } : {}),
+      },
+    ];
+    const request = ++this.#selectionRequest;
+    const loaded = this.#sessions.get(sessionId);
+    if (loaded) {
+      this.#selectSession(loaded, trail);
+      return;
+    }
+    this.#assertSessionCapacity();
+    await this.#withTargetSessionOperation(
+      sessionId,
+      "session/open-child",
+      async () =>
+        this.#openSession(this.#requireDriver(), sessionId, trail, request),
+    );
   }
 
   async openAncestorSession(sessionId: string): Promise<void> {
-    await this.#withSessionMutation("session/open-ancestor", async (driver) => {
-      const ancestorIndex = this.#snapshot.sessionTrail.findIndex(
-        (session) => session.sessionId === sessionId,
+    this.#assertSessionIdle(this.#requireSession(), "session/open-ancestor");
+    const ancestorIndex = this.#snapshot.sessionTrail.findIndex(
+      (session) => session.sessionId === sessionId,
+    );
+    if (ancestorIndex < 0) {
+      throw new PrettyAuiError(
+        "INVALID_CONFIGURATION",
+        `Session '${sessionId}' is not an ancestor of the active session`,
+        { phase: "session/open-ancestor" },
       );
-      if (ancestorIndex < 0) {
-        throw new PrettyAuiError(
-          "INVALID_CONFIGURATION",
-          `Session '${sessionId}' is not an ancestor of the active session`,
-          { phase: "session/open-ancestor" },
-        );
-      }
-      await this.#openSession(
-        driver,
-        sessionId,
-        this.#snapshot.sessionTrail.slice(0, ancestorIndex),
-      );
-    });
+    }
+    const trail = this.#snapshot.sessionTrail.slice(0, ancestorIndex);
+    const request = ++this.#selectionRequest;
+    const loaded = this.#sessions.get(sessionId);
+    if (loaded) {
+      this.#selectSession(loaded, trail);
+      return;
+    }
+    this.#assertSessionCapacity();
+    await this.#withTargetSessionOperation(
+      sessionId,
+      "session/open-ancestor",
+      async () =>
+        this.#openSession(this.#requireDriver(), sessionId, trail, request),
+    );
   }
 
-  async closeSession(): Promise<void> {
-    await this.#withSessionMutation("session/close", async (driver) => {
-      const sessionId = this.#snapshot.sessionId;
-      if (!sessionId) return;
-      await driver.closeSession(sessionId);
-      this.#assertDriverCurrent(driver);
-      this.#resolveInteractions();
-      this.#timeline.reset();
-      this.#setSnapshot({
-        sessionId: undefined,
-        sessionTitle: undefined,
-        sessionTrail: [],
-        historyGap: false,
-        activities: [],
-        configOptions: [],
-        commands: [],
-        phase: "idle",
-      });
-    });
+  async closeSession(sessionId?: string): Promise<void> {
+    const target = this.#requireSession(sessionId);
+    this.#assertSessionIdle(target, "session/close");
+    await this.#withTargetSessionOperation(
+      target.sessionId,
+      "session/close",
+      async () => {
+        const driver = this.#requireDriver();
+        await driver.closeSession(target.sessionId);
+        this.#assertDriverCurrent(driver);
+        this.#resolveInteractions(target.sessionId);
+        this.#sessions.delete(target.sessionId);
+        if (this.#snapshot.sessionId === target.sessionId) {
+          const fallback = [...this.#sessions.values()].sort(
+            (left, right) => right.lastSelected - left.lastSelected,
+          )[0];
+          if (fallback) this.#selectSession(fallback);
+          else this.#clearSelection();
+        } else {
+          this.#publish();
+        }
+      },
+    );
   }
 
   async deleteSession(sessionId: string): Promise<void> {
@@ -329,39 +481,67 @@ class DefaultChatController implements ChatController, ProtocolSink {
         { phase: "session/delete" },
       );
     }
-    await this.#withSessionMutation("session/delete", async (driver) => {
-      await driver.deleteSession(sessionId);
-      this.#assertDriverCurrent(driver);
-      if (this.#snapshot.sessions) {
-        this.#setSnapshot({
-          sessions: {
-            ...this.#snapshot.sessions,
-            sessions: this.#snapshot.sessions.sessions.filter(
-              (session) => session.sessionId !== sessionId,
-            ),
-          },
-        });
-      }
-    });
+    const loaded = this.#sessions.get(sessionId);
+    if (loaded) this.#assertSessionIdle(loaded, "session/delete");
+    await this.#withTargetSessionOperation(
+      sessionId,
+      "session/delete",
+      async () => {
+        const driver = this.#requireDriver();
+        await driver.deleteSession(sessionId);
+        this.#assertDriverCurrent(driver);
+        if (loaded) {
+          this.#resolveInteractions(sessionId);
+          this.#sessions.delete(sessionId);
+        }
+        if (this.#snapshot.sessions) {
+          this.#snapshot = cleanSnapshot({
+            ...this.#snapshot,
+            sessions: {
+              ...this.#snapshot.sessions,
+              sessions: this.#snapshot.sessions.sessions.filter(
+                (session) => session.sessionId !== sessionId,
+              ),
+            },
+          });
+        }
+        this.#publish();
+      },
+    );
   }
 
   async setConfigOption(id: string, value: string | boolean): Promise<void> {
-    await this.#withSessionMutation("session/set-config", async (driver) => {
-      const sessionId = this.#snapshot.sessionId;
-      if (!sessionId)
-        throw new PrettyAuiError("SESSION_NOT_READY", "No active session");
-      const returned = await driver.setConfigOption(sessionId, id, value);
-      this.#assertDriverCurrent(driver);
-      const configOptions = returned.length
-        ? returned
-        : this.#snapshot.configOptions.map((option) =>
-            option.id === id ? { ...option, currentValue: value } : option,
-          );
-      this.#setSnapshot({ configOptions });
-    });
+    const session = this.#requireSession();
+    this.#assertSessionIdle(session, "session/set-config");
+    await this.#withTargetSessionOperation(
+      session.sessionId,
+      "session/set-config",
+      async () => {
+        const driver = this.#requireDriver();
+        const returned = await driver.setConfigOption(
+          session.sessionId,
+          id,
+          value,
+        );
+        this.#assertDriverCurrent(driver);
+        session.configOptions = returned.length
+          ? returned
+          : session.configOptions.map((option) =>
+              option.id === id ? { ...option, currentValue: value } : option,
+            );
+        this.#refreshSession(session);
+      },
+    );
   }
 
   async authenticate(methodId: string): Promise<void> {
+    if (this.#options.allowAuthentication === false) {
+      throw new PrettyAuiError(
+        "AUTHENTICATION_DISABLED",
+        "Agent authentication is disabled by the host",
+        { phase: "auth/login" },
+      );
+    }
     const method = this.#snapshot.authMethods.find(
       (candidate) => candidate.id === methodId,
     );
@@ -370,15 +550,19 @@ class DefaultChatController implements ChatController, ProtocolSink {
         "INVALID_CONFIGURATION",
         `Unknown authentication method '${methodId}'`,
       );
-    await this.#withSessionMutation("auth/login", async (driver) => {
-      this.#setSnapshot({ phase: "connecting", error: undefined });
+    await this.#withNewSessionOperation("auth/login", async () => {
+      const driver = this.#requireDriver();
+      this.#connectionPhase = "connecting";
+      this.#connectionError = undefined;
+      this.#publish();
       try {
         await driver.authenticate(method);
         this.#assertDriverCurrent(driver);
         const session = await driver.newSession(this.#options.session);
         this.#assertDriverCurrent(driver);
-        this.#timeline.reset();
-        this.#applySession(session, this.#timeline);
+        this.#connectionPhase = "ready";
+        const managed = this.#createSession(session);
+        this.#selectSession(managed);
       } catch (error) {
         this.#fail(error);
         throw error;
@@ -387,19 +571,15 @@ class DefaultChatController implements ChatController, ProtocolSink {
   }
 
   async logout(): Promise<void> {
-    await this.#withSessionMutation("auth/logout", async (driver) => {
+    this.#assertConnectionReplaceable();
+    await this.#withNewSessionOperation("auth/logout", async () => {
+      const driver = this.#requireDriver();
       await driver.logout();
       this.#assertDriverCurrent(driver);
       this.#resolveInteractions();
-      this.#timeline.reset();
-      this.#setSnapshot({
-        phase: "auth_required",
-        sessionId: undefined,
-        sessionTrail: [],
-        activities: [],
-        configOptions: [],
-        commands: [],
-      });
+      this.#sessions.clear();
+      this.#connectionPhase = "auth_required";
+      this.#clearSelection();
     });
   }
 
@@ -408,7 +588,7 @@ class DefaultChatController implements ChatController, ProtocolSink {
     if (!pending) return false;
     this.#permissions.delete(id);
     pending.resolve(decision);
-    this.#removeInteraction(id);
+    this.#removeInteraction(id, pending.sessionId);
     return true;
   }
 
@@ -417,44 +597,57 @@ class DefaultChatController implements ChatController, ProtocolSink {
     if (!pending) return false;
     this.#elicitations.delete(id);
     pending.resolve(decision);
-    this.#removeInteraction(id);
+    this.#removeInteraction(id, pending.sessionId);
     return true;
   }
 
   async destroy(): Promise<void> {
     if (this.#destroyed) return;
     this.#destroyed = true;
+    this.#contextUnsubscribe?.();
+    this.#contextUnsubscribe = undefined;
+    this.#contextMutation = undefined;
     this.#connectionGeneration += 1;
     this.#connectionAbort?.abort();
-    this.#activeTurn?.abort.abort(
-      new PrettyAuiError(
-        "TURN_INTERRUPTED",
-        "Chat was destroyed before the turn completed",
-        { phase: "destroy", retryable: false },
-      ),
+    const interrupted = new PrettyAuiError(
+      "TURN_INTERRUPTED",
+      "Chat was destroyed before the turn completed",
+      { phase: "destroy", retryable: false },
     );
+    for (const session of this.#sessions.values()) {
+      session.activeTurn?.abort.abort(interrupted);
+    }
     this.#resolveInteractions();
     const driver = this.#driver;
     this.#driver = undefined;
-    this.#staging = undefined;
-    this.#setSnapshot({ phase: "closed" });
+    this.#staging.clear();
+    this.#connectionPhase = "closed";
+    this.#publish();
     await driver?.close().catch(() => undefined);
     this.#listeners.clear();
   }
 
   onUpdate(sessionId: string, update: unknown): void {
     if (this.#destroyed) return;
-    const target =
-      this.#staging?.sessionId === sessionId ? this.#staging : undefined;
-    if (!target && sessionId !== this.#snapshot.sessionId) return;
-    const timeline = target?.timeline ?? this.#timeline;
-    const effect = timeline.reduce(update, this.#driver?.version ?? 1);
-    if (target) {
-      this.#applyStagingEffect(target, effect);
+    const staging = this.#staging.get(sessionId);
+    const session = this.#sessions.get(sessionId);
+    if (!staging && !session) {
+      this.#emit({
+        type: "diagnostic",
+        sessionId,
+        code: "UNKNOWN_SESSION_UPDATE",
+        message: `Ignored an update for unloaded session '${sessionId}'`,
+      });
       return;
     }
-    this.#applyEffect(effect);
-    this.#setSnapshot({ activities: timeline.activities });
+    const timeline = staging?.timeline ?? session!.timeline;
+    const effect = timeline.reduce(update, this.#driver?.version ?? 1);
+    if (staging) {
+      this.#applyStagingEffect(staging, effect);
+      return;
+    }
+    const summaryChanged = this.#applyEffect(session!, effect);
+    this.#refreshSession(session!, summaryChanged);
   }
 
   onPermission(
@@ -462,11 +655,8 @@ class DefaultChatController implements ChatController, ProtocolSink {
     interaction: Omit<PermissionInteraction, "id">,
     _raw: unknown,
   ): Promise<PermissionDecision> {
-    if (
-      this.#destroyed ||
-      !this.#activeTurn ||
-      sessionId !== this.#snapshot.sessionId
-    ) {
+    const session = this.#sessions.get(sessionId);
+    if (this.#destroyed || !session?.activeTurn) {
       return Promise.resolve({ outcome: "cancelled" });
     }
     if (!this.#hasInteractionCapacity()) {
@@ -475,8 +665,8 @@ class DefaultChatController implements ChatController, ProtocolSink {
     const id = `permission-${++this.#counter}`;
     const complete: PermissionInteraction = { ...interaction, id };
     return new Promise((resolve) => {
-      this.#permissions.set(id, { interaction: complete, resolve });
-      this.#addInteraction(complete);
+      this.#permissions.set(id, { sessionId, interaction: complete, resolve });
+      this.#addInteraction(complete, sessionId);
     });
   }
 
@@ -487,7 +677,7 @@ class DefaultChatController implements ChatController, ProtocolSink {
   ): Promise<ElicitationDecision> {
     if (
       this.#destroyed ||
-      (sessionId !== undefined && sessionId !== this.#snapshot.sessionId) ||
+      (sessionId !== undefined && !this.#sessions.has(sessionId)) ||
       (interaction.elicitationId !== undefined &&
         this.#findElicitation(interaction.elicitationId) !== undefined)
     ) {
@@ -499,8 +689,12 @@ class DefaultChatController implements ChatController, ProtocolSink {
     const id = `elicitation-${++this.#counter}`;
     const complete: ElicitationInteraction = { ...interaction, id };
     return new Promise((resolve) => {
-      this.#elicitations.set(id, { interaction: complete, resolve });
-      this.#addInteraction(complete);
+      this.#elicitations.set(id, {
+        ...(sessionId === undefined ? {} : { sessionId }),
+        interaction: complete,
+        resolve,
+      });
+      this.#addInteraction(complete, sessionId);
     });
   }
 
@@ -512,7 +706,7 @@ class DefaultChatController implements ChatController, ProtocolSink {
     if (!pending) return;
     this.#elicitations.delete(id);
     pending.resolve({ action: "accept" });
-    this.#removeInteraction(id);
+    this.#removeInteraction(id, pending.sessionId);
   }
 
   onProtocol(method: string, raw: unknown): void {
@@ -554,9 +748,13 @@ class DefaultChatController implements ChatController, ProtocolSink {
     this.#connectionAbort?.abort();
     const connectionAbort = new AbortController();
     this.#connectionAbort = connectionAbort;
-    this.#setSnapshot({ phase: "connecting", error: undefined });
+    this.#connectionPhase = "connecting";
+    this.#connectionError = undefined;
+    this.#publish();
     const previous = this.#driver;
     const previousSessionId = this.#snapshot.sessionId;
+    const previousTrail = this.#sessionTrail;
+    const previousSessions = [...this.#sessions.values()];
     if (previous) {
       this.#driver = undefined;
       await previous.close().catch(() => undefined);
@@ -583,37 +781,113 @@ class DefaultChatController implements ChatController, ProtocolSink {
         throw connectionClosedError();
       }
       this.#driver = driver;
-      this.#setSnapshot({
+      this.#snapshot = cleanSnapshot({
+        ...this.#snapshot,
         protocolVersion: driver.version,
         agentName: driver.initialized.agentName,
-        authMethods: driver.initialized.authMethods,
+        authMethods:
+          this.#options.allowAuthentication === false
+            ? []
+            : driver.initialized.authMethods,
         capabilities: driver.initialized.capabilities,
       });
+      this.#publish();
       this.#emit({ type: "connected", protocolVersion: driver.version });
-      let session: ProtocolSession;
-      const reopeningSession =
-        !createSession &&
-        previousSessionId &&
-        (driver.initialized.capabilities.resumeSession ||
-          driver.initialized.capabilities.loadSession);
-      if (reopeningSession) {
-        session = await driver.openSession(
-          previousSessionId,
-          this.#options.session,
-          driver.initialized.capabilities.resumeSession ? "none" : "all",
-        );
-      } else {
-        session = await driver.newSession(this.#options.session);
+      if (createSession) {
+        const initial = this.#options.initialSession ?? {
+          type: "new" as const,
+        };
+        if (initial.type === "none") {
+          this.#sessions.clear();
+          this.#connectionPhase = "ready";
+          this.#clearSelection();
+          return;
+        }
+        if (initial.type === "open") {
+          this.#assertSessionCapacity();
+          await this.#openSession(
+            driver,
+            initial.sessionId,
+            [],
+            ++this.#selectionRequest,
+          );
+          this.#connectionPhase = "ready";
+          this.#publish();
+          return;
+        }
+        const opened = await driver.newSession(this.#options.session);
+        this.#assertConnectionCurrent(generation, driver);
+        this.#sessions.clear();
+        this.#connectionPhase = "ready";
+        this.#selectSession(this.#createSession(opened));
+        return;
       }
-      this.#assertConnectionCurrent(generation, driver);
-      if (createSession || !reopeningSession) this.#timeline.reset();
-      this.#applySession(
-        session,
-        this.#timeline,
-        undefined,
-        [],
-        reopeningSession ? this.#snapshot.sessionTrail : [],
-      );
+
+      if (!previousSessions.length) {
+        this.#connectionPhase = "ready";
+        this.#clearSelection();
+        return;
+      }
+      if (
+        !driver.initialized.capabilities.resumeSession &&
+        !driver.initialized.capabilities.loadSession
+      ) {
+        const opened = await driver.newSession(this.#options.session);
+        this.#assertConnectionCurrent(generation, driver);
+        this.#sessions.clear();
+        this.#connectionPhase = "ready";
+        this.#selectSession(this.#createSession(opened));
+        return;
+      }
+
+      const ordered = [...previousSessions].sort((left, right) => {
+        if (left.sessionId === previousSessionId) return -1;
+        if (right.sessionId === previousSessionId) return 1;
+        return right.lastSelected - left.lastSelected;
+      });
+      for (const oldSession of ordered) {
+        try {
+          const history = driver.initialized.capabilities.resumeSession
+            ? "none"
+            : "all";
+          const timeline =
+            history === "none" ? oldSession.timeline : new TimelineStore();
+          const staging: StagingSession = {
+            sessionId: oldSession.sessionId,
+            timeline,
+            configOptions: oldSession.configOptions,
+            commands: oldSession.commands,
+            sessionTitle: oldSession.sessionTitle,
+          };
+          this.#staging.set(oldSession.sessionId, staging);
+          const restored = await driver.openSession(
+            oldSession.sessionId,
+            this.#options.session,
+            history,
+          );
+          this.#assertConnectionCurrent(generation, driver);
+          const managed = this.#createSession(
+            restored,
+            timeline,
+            staging,
+            oldSession.instanceId,
+          );
+          managed.lastSelected = oldSession.lastSelected;
+          managed.usage = oldSession.usage;
+          if (oldSession.sessionId === previousSessionId) {
+            this.#selectSession(managed, previousTrail);
+          }
+        } catch (error) {
+          if (oldSession.sessionId === previousSessionId) throw error;
+          oldSession.phase = "error";
+          oldSession.error = toChatError(error);
+          this.#sessions.set(oldSession.sessionId, oldSession);
+        } finally {
+          this.#staging.delete(oldSession.sessionId);
+        }
+      }
+      this.#connectionPhase = "ready";
+      this.#publish();
     } catch (error) {
       if (!this.#isConnectionCurrent(generation)) {
         if (driver && this.#driver === driver) this.#driver = undefined;
@@ -623,9 +897,20 @@ class DefaultChatController implements ChatController, ProtocolSink {
       if (
         error instanceof PrettyAuiError &&
         error.code === "AUTHENTICATION_REQUIRED" &&
-        this.#snapshot.authMethods.length
+        driver?.initialized.authMethods.length
       ) {
-        this.#setSnapshot({ phase: "auth_required", error: undefined });
+        if (this.#options.allowAuthentication === false) {
+          const disabled = new PrettyAuiError(
+            "AUTHENTICATION_DISABLED",
+            "The agent requires authentication disabled by the host",
+            { cause: error, protocol: driver?.version, phase: "session/new" },
+          );
+          this.#fail(disabled);
+          throw disabled;
+        }
+        this.#connectionPhase = "auth_required";
+        this.#connectionError = undefined;
+        this.#publish();
         throw new PrettyAuiError(
           "AUTHENTICATION_REQUIRED",
           "Authentication is required before a session can be created",
@@ -647,15 +932,20 @@ class DefaultChatController implements ChatController, ProtocolSink {
   ): Promise<{ stopReason: string }> {
     try {
       const driver = this.#requireDriver();
-      const sessionId = this.#snapshot.sessionId;
-      if (!sessionId)
-        throw new PrettyAuiError("SESSION_NOT_READY", "No active session");
-      const contextItems = await this.#resolveContext(input, turn.abort.signal);
+      const session = this.#requireSession(turn.sessionId);
+      const contextItems = await this.#resolveContext(
+        session.sessionId,
+        input,
+        turn.contextSelection,
+        turn.abort.signal,
+      );
       throwIfAborted(turn.abort.signal);
+      const submittedContext = contextItems.map((item) => ({
+        ...item,
+        content: item.content.map((block) => withContextMeta(block, item)),
+      }));
       const prompt = [
-        ...contextItems.flatMap((item) =>
-          item.content.map((block) => withContextMeta(block, item)),
-        ),
+        ...submittedContext.flatMap((item) => item.content),
         ...input,
       ];
       validatePrompt(
@@ -663,15 +953,26 @@ class DefaultChatController implements ChatController, ProtocolSink {
         driver.initialized.promptCapabilities,
         driver.version,
       );
-      this.#setSnapshot({
-        contextItems: contextItems.map(({ id, label }) => ({ id, label })),
-      });
+      if (
+        !wireMessageWithinBudget({
+          jsonrpc: "2.0",
+          id: Number.MAX_SAFE_INTEGER,
+          method: "session/prompt",
+          params: { sessionId: session.sessionId, prompt },
+        })
+      ) {
+        throw new PrettyAuiError(
+          "INVALID_CONFIGURATION",
+          "The prepared ACP prompt exceeds the 2 MiB wire-message limit",
+          { protocol: driver.version, phase: "prompt" },
+        );
+      }
       throwIfAborted(turn.abort.signal);
       turn.submitted = true;
-      const stopReason = await driver.prompt(sessionId, prompt, () => {
+      const stopReason = await driver.prompt(session.sessionId, prompt, () => {
         if (this.#destroyed) return;
-        this.#timeline.markUserAccepted();
-        this.#setSnapshot({ activities: this.#timeline.activities });
+        session.timeline.markUserAccepted(submittedContext);
+        this.#refreshSession(session);
       });
       return this.#completeTurn(
         turn,
@@ -681,44 +982,89 @@ class DefaultChatController implements ChatController, ProtocolSink {
       if (turn.cancelled || error === TURN_CANCELLED) {
         return this.#completeTurn(turn, "cancelled");
       }
-      if (this.#activeTurn === turn) this.#activeTurn = undefined;
-      this.#fail(error);
+      const session = this.#sessions.get(turn.sessionId);
+      if (session?.activeTurn === turn) session.activeTurn = undefined;
+      this.#fail(error, turn.sessionId);
       throw error;
     }
   }
 
   async #resolveContext(
+    sessionId: string,
     input: readonly ContentBlock[],
+    selection: readonly ContextSelectionItem[],
     signal: AbortSignal,
   ): Promise<readonly ContextItem[]> {
     try {
       const source = this.#options.context;
       if (!source) return [];
-      const items =
-        typeof source === "function"
-          ? await abortable(
-              source({
-                ...(this.#snapshot.sessionId
-                  ? { sessionId: this.#snapshot.sessionId }
-                  : {}),
-                input,
-                ...(this.#snapshot.protocolVersion
-                  ? { protocolVersion: this.#snapshot.protocolVersion }
-                  : {}),
-                signal,
-              }),
+      const items = isContextProvider(source)
+        ? await abortable(
+            source.resolve({
+              sessionId,
+              input,
+              selection,
+              ...(this.#snapshot.protocolVersion
+                ? { protocolVersion: this.#snapshot.protocolVersion }
+                : {}),
+              capabilities:
+                this.#requireDriver().initialized.promptCapabilities,
               signal,
-            )
-          : source;
+            }),
+            signal,
+          )
+        : source;
+      if (
+        isContextProvider(source) &&
+        (items.length !== selection.length ||
+          items.some((item, index) => item.id !== selection[index]?.id))
+      ) {
+        throw new Error(
+          "Resolved context IDs must match the frozen selection order",
+        );
+      }
       const ids = new Set<string>();
       if (items.length > 64)
         throw new Error("Context is limited to 64 items per turn");
       for (const item of items) {
-        if (!item.id || ids.has(item.id))
+        if (
+          !isRecord(item) ||
+          typeof item.id !== "string" ||
+          !item.id.trim() ||
+          item.id.length > 16 * 1024
+        ) {
+          throw new Error("Context item IDs must be non-empty bounded strings");
+        }
+        if (ids.has(item.id))
           throw new Error(`Context item IDs must be unique: '${item.id}'`);
+        if (
+          typeof item.label !== "string" ||
+          !item.label.trim() ||
+          item.label.length > 16 * 1024
+        ) {
+          throw new Error(
+            "Context item labels must be non-empty bounded strings",
+          );
+        }
+        if (!Array.isArray(item.content) || !item.content.length) {
+          throw new Error(
+            "Context items must contain at least one content block",
+          );
+        }
         ids.add(item.id);
       }
-      return items;
+      const canonical = items.map((item) => ({
+        id: item.id,
+        label: item.label,
+        content: item.content.map(canonicalContextBlock),
+      }));
+      const driver = this.#requireDriver();
+      validatePrompt(
+        canonical.flatMap((item) => item.content),
+        driver.initialized.promptCapabilities,
+        driver.version,
+      );
+      return canonical;
     } catch (error) {
       if (signal.aborted) throw signal.reason ?? error;
       throw new PrettyAuiError(
@@ -734,37 +1080,11 @@ class DefaultChatController implements ChatController, ProtocolSink {
     }
   }
 
-  #applySession(
-    session: ProtocolSession,
-    timeline: TimelineStore,
-    title?: string,
-    commands: ChatSnapshot["commands"] = [],
-    sessionTrail: ChatSnapshot["sessionTrail"] = [],
-  ): void {
-    if (this.#destroyed) return;
-    this.#snapshot = cleanSnapshot({
-      ...this.#snapshot,
-      phase: "idle",
-      sessionId: session.sessionId,
-      sessionTitle: title,
-      sessionTrail: [...sessionTrail],
-      historyGap: session.historyGap ?? false,
-      activities: timeline.activities,
-      configOptions: session.configOptions,
-      commands,
-      interactions: [],
-      contextItems: [],
-      stopReason: undefined,
-      error: undefined,
-    });
-    this.#notify();
-    this.#emit({ type: "session_changed", sessionId: session.sessionId });
-  }
-
   async #openSession(
     driver: ProtocolDriver,
     sessionId: string,
     sessionTrail: ChatSnapshot["sessionTrail"],
+    selectionRequest: number,
   ): Promise<void> {
     const staging: StagingSession = {
       sessionId,
@@ -773,7 +1093,7 @@ class DefaultChatController implements ChatController, ProtocolSink {
       commands: [],
       sessionTitle: undefined,
     };
-    this.#staging = staging;
+    this.#staging.set(sessionId, staging);
     try {
       const session = await driver.openSession(
         sessionId,
@@ -781,58 +1101,62 @@ class DefaultChatController implements ChatController, ProtocolSink {
         "all",
       );
       this.#assertDriverCurrent(driver);
-      const oldSessionId = this.#snapshot.sessionId;
-      this.#resolveInteractions();
-      this.#timeline = staging.timeline;
-      this.#applySession(
-        {
-          ...session,
-          configOptions: session.configOptions.length
-            ? session.configOptions
-            : staging.configOptions,
-        },
-        staging.timeline,
-        staging.sessionTitle,
-        staging.commands,
-        sessionTrail,
-      );
-      if (oldSessionId && driver.initialized.capabilities.closeSession) {
-        await driver.closeSession(oldSessionId).catch(() => undefined);
+      const managed = this.#createSession(session, staging.timeline, staging);
+      if (selectionRequest === this.#selectionRequest) {
+        this.#selectSession(managed, sessionTrail);
+      } else {
+        this.#publish();
       }
     } finally {
-      if (this.#staging === staging) this.#staging = undefined;
+      if (this.#staging.get(sessionId) === staging)
+        this.#staging.delete(sessionId);
     }
   }
 
-  #applyEffect(effect: ReducerEffect): void {
-    const patch: SnapshotPatch = {};
-    if (effect.state && !this.#activeTurn) {
+  #applyEffect(session: ManagedSession, effect: ReducerEffect): boolean {
+    let summaryChanged = false;
+    if (
+      effect.state &&
+      !session.activeTurn &&
+      !(session.phase === "cancelling" && effect.state === "idle")
+    ) {
       this.#emit({
         type: "diagnostic",
+        sessionId: session.sessionId,
         code: "STALE_SESSION_STATE",
         message: `Ignored ${effect.state} state without an active turn`,
       });
     } else {
-      if (effect.state === "running") patch.phase = "running";
-      if (effect.state === "requires_action") patch.phase = "awaiting_user";
+      if (effect.state === "running") {
+        session.phase = "running";
+        summaryChanged = true;
+      }
+      if (effect.state === "requires_action") {
+        session.phase = "awaiting_user";
+        summaryChanged = true;
+      }
       if (effect.state === "idle") {
-        patch.phase = "idle";
-        if (effect.stopReason) patch.stopReason = effect.stopReason;
+        session.phase = "idle";
+        if (effect.stopReason) session.stopReason = effect.stopReason;
+        summaryChanged = true;
       }
     }
-    if (effect.commands) patch.commands = effect.commands;
-    if (effect.configOptions) patch.configOptions = effect.configOptions;
-    if (effect.sessionTitle !== undefined)
-      patch.sessionTitle = effect.sessionTitle ?? undefined;
-    if (effect.usage) patch.usage = effect.usage;
+    if (effect.commands) session.commands = effect.commands;
+    if (effect.configOptions) session.configOptions = effect.configOptions;
+    if (effect.sessionTitle !== undefined) {
+      session.sessionTitle = effect.sessionTitle ?? undefined;
+      summaryChanged = true;
+    }
+    if (effect.usage) session.usage = effect.usage;
     if (effect.unsupported) {
       this.#emit({
         type: "diagnostic",
+        sessionId: session.sessionId,
         code: "UNSUPPORTED_UPDATE",
         message: effect.unsupported,
       });
     }
-    if (Object.keys(patch).length) this.#setSnapshot(patch);
+    return summaryChanged;
   }
 
   #hasInteractionCapacity(): boolean {
@@ -852,36 +1176,71 @@ class DefaultChatController implements ChatController, ProtocolSink {
       staging.sessionTitle = effect.sessionTitle ?? undefined;
   }
 
-  #addInteraction(interaction: ChatInteraction): void {
-    this.#setSnapshot({
-      phase: "awaiting_user",
-      interactions: [...this.#snapshot.interactions, interaction],
-    });
+  #addInteraction(
+    interaction: ChatInteraction,
+    sessionId: string | undefined,
+  ): void {
+    if (sessionId === undefined) {
+      this.#connectionInteractions = [
+        ...this.#connectionInteractions,
+        interaction,
+      ];
+      this.#publish();
+      return;
+    }
+    const session = this.#sessions.get(sessionId);
+    if (!session) return;
+    session.interactions = [...session.interactions, interaction];
+    session.phase = "awaiting_user";
+    this.#refreshSession(session, true);
   }
 
-  #removeInteraction(id: string): void {
-    const interactions = this.#snapshot.interactions.filter(
+  #removeInteraction(id: string, sessionId: string | undefined): void {
+    if (sessionId === undefined) {
+      this.#connectionInteractions = this.#connectionInteractions.filter(
+        (interaction) => interaction.id !== id,
+      );
+      this.#publish();
+      return;
+    }
+    const session = this.#sessions.get(sessionId);
+    if (!session) return;
+    session.interactions = session.interactions.filter(
       (interaction) => interaction.id !== id,
     );
-    this.#setSnapshot({
-      interactions,
-      phase: interactions.length
-        ? "awaiting_user"
-        : this.#activeTurn
-          ? "running"
-          : "idle",
-    });
+    session.phase = session.interactions.length
+      ? "awaiting_user"
+      : session.activeTurn
+        ? "running"
+        : "idle";
+    this.#refreshSession(session, true);
   }
 
-  #resolveInteractions(): void {
-    for (const pending of this.#permissions.values())
+  #resolveInteractions(sessionId?: string): void {
+    for (const [id, pending] of this.#permissions) {
+      if (sessionId !== undefined && pending.sessionId !== sessionId) continue;
+      this.#permissions.delete(id);
       pending.resolve({ outcome: "cancelled" });
-    for (const pending of this.#elicitations.values())
+    }
+    for (const [id, pending] of this.#elicitations) {
+      if (sessionId !== undefined && pending.sessionId !== sessionId) continue;
+      this.#elicitations.delete(id);
       pending.resolve({ action: "cancel" });
-    this.#permissions.clear();
-    this.#elicitations.clear();
-    if (this.#snapshot.interactions.length)
-      this.#setSnapshot({ interactions: [] });
+    }
+    if (sessionId === undefined) {
+      this.#connectionInteractions = [];
+      for (const session of this.#sessions.values()) {
+        session.interactions = [];
+        if (!session.activeTurn) session.phase = "idle";
+      }
+      this.#publish();
+      return;
+    }
+    const session = this.#sessions.get(sessionId);
+    if (!session) return;
+    session.interactions = [];
+    session.phase = session.activeTurn ? "running" : "idle";
+    this.#refreshSession(session, true);
   }
 
   #findElicitation(elicitationId: string): string | undefined {
@@ -899,7 +1258,11 @@ class DefaultChatController implements ChatController, ProtocolSink {
   #assertUsableSession(): void {
     if (this.#destroyed)
       throw new PrettyAuiError("CONNECTION_CLOSED", "Chat has been destroyed");
-    if (!this.#driver || !this.#snapshot.sessionId) {
+    if (
+      this.#connectionPhase !== "ready" ||
+      !this.#driver ||
+      !this.#snapshot.sessionId
+    ) {
       throw new PrettyAuiError(
         "SESSION_NOT_READY",
         "The chat session is not ready",
@@ -915,22 +1278,69 @@ class DefaultChatController implements ChatController, ProtocolSink {
     }
   }
 
-  #assertIdleForSessionChange(): void {
+  #assertSessionIdle(session: ManagedSession, phase: string): void {
+    if (session.activeTurn || session.interactions.length) {
+      throw new PrettyAuiError(
+        "SESSION_BUSY",
+        `Finish session '${session.sessionId}' before changing it`,
+        { phase },
+      );
+    }
+  }
+
+  #assertConnectionReplaceable(): void {
     if (this.#destroyed) throw connectionClosedError();
     if (
-      this.#activeTurn ||
-      this.#permissions.size ||
-      this.#elicitations.size ||
-      this.#snapshot.interactions.length ||
-      this.#snapshot.phase === "running" ||
-      this.#snapshot.phase === "cancelling"
+      this.#connectionInteractions.length ||
+      [...this.#sessions.values()].some(
+        (session) => session.activeTurn || session.interactions.length,
+      )
     ) {
       throw new PrettyAuiError(
         "SESSION_BUSY",
-        "Finish the current turn or interaction first",
-        { phase: "session" },
+        "Finish all turns and interactions before replacing the connection",
+        { phase: "connection/reconnect" },
       );
     }
+  }
+
+  #assertSessionCapacity(): void {
+    const reservations = [...this.#staging.keys()].filter(
+      (sessionId) => !this.#sessions.has(sessionId),
+    ).length;
+    if (this.#sessions.size + reservations < 16) return;
+    throw new PrettyAuiError(
+      "SESSION_LIMIT",
+      "Close a loaded session before opening another one",
+      { phase: "session" },
+    );
+  }
+
+  #mapAuthenticationFailure(error: unknown, phase: string): unknown {
+    if (
+      !(error instanceof PrettyAuiError) ||
+      error.code !== "AUTHENTICATION_REQUIRED" ||
+      !this.#driver?.initialized.authMethods.length
+    ) {
+      return error;
+    }
+    if (this.#options.allowAuthentication === false) {
+      const disabled = new PrettyAuiError(
+        "AUTHENTICATION_DISABLED",
+        "The agent requires authentication disabled by the host",
+        { cause: error, protocol: this.#driver.version, phase },
+      );
+      this.#fail(disabled);
+      return disabled;
+    }
+    this.#connectionPhase = "auth_required";
+    this.#connectionError = undefined;
+    this.#publish();
+    return new PrettyAuiError(
+      "AUTHENTICATION_REQUIRED",
+      "Authentication is required before a session can be created",
+      { cause: error, protocol: this.#driver.version, phase },
+    );
   }
 
   #requireDriver(): ProtocolDriver {
@@ -943,16 +1353,212 @@ class DefaultChatController implements ChatController, ProtocolSink {
     return this.#driver;
   }
 
-  #fail(error: unknown): void {
+  #fail(error: unknown, sessionId?: string): void {
     if (this.#destroyed) return;
     const normalized = toChatError(error);
-    this.#setSnapshot({ phase: "error", error: normalized });
+    const session = sessionId ? this.#sessions.get(sessionId) : undefined;
+    if (session) {
+      session.phase = "error";
+      session.error = normalized;
+      this.#refreshSession(session, true);
+      this.#emit({
+        type: "error",
+        sessionId: session.sessionId,
+        error: normalized,
+      });
+      return;
+    }
+    this.#connectionPhase = "error";
+    this.#connectionError = normalized;
+    this.#publish();
     this.#emit({ type: "error", error: normalized });
   }
 
-  #setSnapshot(patch: SnapshotPatch): void {
-    if (this.#destroyed && patch.phase !== "closed") return;
-    this.#snapshot = cleanSnapshot({ ...this.#snapshot, ...patch });
+  #selectedSession(): ManagedSession | undefined {
+    const sessionId = this.#snapshot.sessionId;
+    return sessionId ? this.#sessions.get(sessionId) : undefined;
+  }
+
+  #requireSession(sessionId = this.#snapshot.sessionId): ManagedSession {
+    if (!sessionId) {
+      throw new PrettyAuiError("SESSION_NOT_READY", "No active session", {
+        phase: "session",
+      });
+    }
+    const session = this.#sessions.get(sessionId);
+    if (!session) {
+      throw new PrettyAuiError(
+        "SESSION_NOT_READY",
+        `Session '${sessionId}' is not loaded`,
+        { phase: "session" },
+      );
+    }
+    return session;
+  }
+
+  #createSession(
+    session: ProtocolSession,
+    timeline = new TimelineStore(),
+    staging?: StagingSession,
+    instanceId = `session-instance-${++this.#sessionInstanceCounter}`,
+  ): ManagedSession {
+    const managed: ManagedSession = {
+      sessionId: session.sessionId,
+      instanceId,
+      timeline,
+      phase: "idle",
+      activeTurn: undefined,
+      configOptions: session.configOptions.length
+        ? session.configOptions
+        : (staging?.configOptions ?? []),
+      commands: staging?.commands ?? session.commands ?? [],
+      interactions: [],
+      sessionTitle: staging?.sessionTitle,
+      historyGap: session.historyGap ?? false,
+      usage: undefined,
+      stopReason: undefined,
+      error: undefined,
+      lastSelected: 0,
+    };
+    this.#sessions.set(session.sessionId, managed);
+    return managed;
+  }
+
+  #selectSession(
+    session: ManagedSession,
+    trail: ChatSnapshot["sessionTrail"] = [],
+  ): void {
+    session.lastSelected = ++this.#selectionCounter;
+    this.#sessionTrail = [...trail];
+    this.#snapshot = cleanSnapshot({
+      ...this.#snapshot,
+      sessionId: session.sessionId,
+    });
+    this.#publish();
+    this.#emit({ type: "session_changed", sessionId: session.sessionId });
+  }
+
+  #clearSelection(): void {
+    this.#sessionTrail = [];
+    this.#snapshot = cleanSnapshot({
+      ...this.#snapshot,
+      sessionId: undefined,
+    });
+    this.#publish();
+    this.#emit({ type: "session_changed" });
+  }
+
+  #refreshSession(session: ManagedSession, summaryChanged = false): void {
+    if (this.#snapshot.sessionId === session.sessionId || summaryChanged) {
+      this.#publish();
+    }
+  }
+
+  #contextProvider(operation: string): ContextProvider {
+    if (this.#destroyed) throw connectionClosedError();
+    const provider = this.#options.context;
+    if (!isContextProvider(provider)) {
+      throw new PrettyAuiError(
+        "METHOD_NOT_AVAILABLE",
+        "The configured context is not mutable",
+        { phase: `context/${operation}` },
+      );
+    }
+    return provider;
+  }
+
+  async #mutateContext(
+    phase: string,
+    operation: () => void | Promise<void>,
+  ): Promise<void> {
+    if (this.#destroyed) throw connectionClosedError();
+    if (this.#contextMutation) {
+      throw new PrettyAuiError(
+        "SESSION_BUSY",
+        "Wait for the current context change to finish",
+        { phase },
+      );
+    }
+    const token = Symbol(phase);
+    this.#contextMutation = token;
+    this.#publish();
+    try {
+      await operation();
+      if (this.#destroyed || this.#contextMutation !== token) {
+        throw connectionClosedError();
+      }
+      this.#syncContextSelection();
+    } catch (error) {
+      if (this.#destroyed) throw connectionClosedError();
+      throw new PrettyAuiError(
+        "CONTEXT_FAILED",
+        "Context selection could not be changed",
+        { cause: error, phase, retryable: true },
+      );
+    } finally {
+      if (this.#contextMutation === token) {
+        this.#contextMutation = undefined;
+        this.#publish();
+      }
+    }
+  }
+
+  #syncContextSelection(): void {
+    this.#contextSelection = readContextSelection(this.#options.context);
+    this.#publish();
+  }
+
+  #contextProjection(): ChatSnapshot["contextSelection"] {
+    const provider = this.#options.context;
+    return {
+      items: this.#contextSelection,
+      canAdd: Boolean(isContextProvider(provider) && provider.add),
+      canRemove: Boolean(isContextProvider(provider) && provider.remove),
+      busy: this.#contextMutation !== undefined,
+    };
+  }
+
+  #publish(): void {
+    if (this.#destroyed && this.#connectionPhase !== "closed") return;
+    const selected = this.#selectedSession();
+    const connectionPhase = this.#connectionPhase;
+    const phase =
+      connectionPhase === "ready"
+        ? (selected?.phase ?? "idle")
+        : connectionPhase;
+    const error =
+      connectionPhase === "error" ? this.#connectionError : selected?.error;
+    this.#snapshot = cleanSnapshot({
+      protocolVersion: this.#snapshot.protocolVersion,
+      agentName: this.#snapshot.agentName,
+      loadedSessions: [...this.#sessions.values()].map((session) => ({
+        sessionId: session.sessionId,
+        ...(session.sessionTitle ? { title: session.sessionTitle } : {}),
+        phase: session.phase,
+        interactionCount: session.interactions.length,
+        ...(session.error ? { error: session.error } : {}),
+      })),
+      sessionId: selected?.sessionId,
+      sessionInstanceId: selected?.instanceId,
+      sessionTitle: selected?.sessionTitle,
+      sessionTrail: this.#sessionTrail,
+      historyGap: selected?.historyGap ?? false,
+      activities: selected?.timeline.activities ?? [],
+      configOptions: selected?.configOptions ?? [],
+      commands: selected?.commands ?? [],
+      contextSelection: this.#contextProjection(),
+      interactions: [
+        ...(selected?.interactions ?? []),
+        ...this.#connectionInteractions,
+      ],
+      authMethods: this.#snapshot.authMethods,
+      sessions: this.#snapshot.sessions,
+      capabilities: this.#snapshot.capabilities,
+      usage: selected?.usage,
+      stopReason: selected?.stopReason,
+      error,
+      phase,
+    });
     this.#notify();
   }
 
@@ -980,43 +1586,78 @@ class DefaultChatController implements ChatController, ProtocolSink {
     stopReason: string,
   ): { readonly stopReason: string } {
     if (this.#destroyed) throw connectionClosedError();
-    if (this.#activeTurn === turn) this.#activeTurn = undefined;
-    this.#setSnapshot({
-      phase: "idle",
+    const session = this.#requireSession(turn.sessionId);
+    if (session.activeTurn === turn) session.activeTurn = undefined;
+    session.phase = this.#driver?.promptReady(session.sessionId)
+      ? "idle"
+      : "cancelling";
+    session.stopReason = stopReason;
+    this.#refreshSession(session, true);
+    this.#emit({
+      type: "turn_completed",
+      sessionId: session.sessionId,
+      turnId: turn.id,
       stopReason,
-      activities: this.#timeline.activities,
     });
-    this.#emit({ type: "turn_completed", turnId: turn.id, stopReason });
     return { stopReason };
   }
 
-  async #withSessionMutation<Value>(
-    phase: string,
-    operation: (driver: ProtocolDriver) => Promise<Value>,
-  ): Promise<Value> {
-    return this.#withSessionOperation(phase, () =>
-      operation(this.#requireDriver()),
-    );
-  }
-
-  async #withSessionOperation<Value>(
+  async #withNewSessionOperation<Value>(
     phase: string,
     operation: () => Promise<Value>,
   ): Promise<Value> {
-    this.#assertIdleForSessionChange();
-    if (this.#sessionMutation) {
+    if (this.#destroyed) throw connectionClosedError();
+    if (this.#newSessionMutation) {
       throw new PrettyAuiError(
         "SESSION_BUSY",
-        "Wait for the current session operation to finish",
+        "Wait for the current connection-level session operation to finish",
+        { protocol: this.#driver?.version, phase },
+      );
+    }
+    if (this.#sessionMutations.size) {
+      throw new PrettyAuiError(
+        "SESSION_BUSY",
+        "Wait for target-session operations to finish",
         { protocol: this.#driver?.version, phase },
       );
     }
     const mutation = Symbol(phase);
-    this.#sessionMutation = mutation;
+    this.#newSessionMutation = mutation;
     try {
       return await operation();
     } finally {
-      if (this.#sessionMutation === mutation) this.#sessionMutation = undefined;
+      if (this.#newSessionMutation === mutation)
+        this.#newSessionMutation = undefined;
+    }
+  }
+
+  async #withTargetSessionOperation<Value>(
+    sessionId: string,
+    phase: string,
+    operation: () => Promise<Value>,
+  ): Promise<Value> {
+    if (this.#destroyed) throw connectionClosedError();
+    if (this.#newSessionMutation) {
+      throw new PrettyAuiError(
+        "SESSION_BUSY",
+        "Wait for the current connection-level session operation to finish",
+        { protocol: this.#driver?.version, phase },
+      );
+    }
+    if (this.#sessionMutations.has(sessionId)) {
+      throw new PrettyAuiError(
+        "SESSION_BUSY",
+        `Wait for the current operation on session '${sessionId}'`,
+        { protocol: this.#driver?.version, phase },
+      );
+    }
+    const mutation = Symbol(phase);
+    this.#sessionMutations.set(sessionId, mutation);
+    try {
+      return await operation();
+    } finally {
+      if (this.#sessionMutations.get(sessionId) === mutation)
+        this.#sessionMutations.delete(sessionId);
     }
   }
 
@@ -1039,9 +1680,76 @@ class DefaultChatController implements ChatController, ProtocolSink {
   }
 }
 
-type SnapshotPatch = Partial<{
-  -readonly [Key in keyof ChatSnapshot]: ChatSnapshot[Key] | undefined;
-}>;
+function isContextProvider(
+  value: ChatOptions["context"],
+): value is ContextProvider {
+  return (
+    !Array.isArray(value) &&
+    isRecord(value) &&
+    typeof value.getSelection === "function" &&
+    typeof value.subscribe === "function" &&
+    typeof value.resolve === "function"
+  );
+}
+
+function readContextSelection(
+  source: ChatOptions["context"],
+): readonly ContextSelectionItem[] {
+  if (!source) return Object.freeze([]);
+  const values = isContextProvider(source)
+    ? source.getSelection()
+    : (source as readonly ContextItem[]);
+  if (!Array.isArray(values)) {
+    throw new PrettyAuiError(
+      "INVALID_CONFIGURATION",
+      "Context selection must be an array",
+      { phase: "context/selection" },
+    );
+  }
+  if (values.length > 64) {
+    throw new PrettyAuiError(
+      "INVALID_CONFIGURATION",
+      "Context is limited to 64 selected items",
+      { phase: "context/selection" },
+    );
+  }
+  const ids = new Set<string>();
+  const items = values.map((value) => {
+    if (
+      !isRecord(value) ||
+      typeof value.id !== "string" ||
+      !value.id.trim() ||
+      value.id.length > 16 * 1024
+    ) {
+      throw new PrettyAuiError(
+        "INVALID_CONFIGURATION",
+        "Context selection IDs must be non-empty bounded strings",
+        { phase: "context/selection" },
+      );
+    }
+    if (ids.has(value.id)) {
+      throw new PrettyAuiError(
+        "INVALID_CONFIGURATION",
+        `Context selection IDs must be unique: '${value.id}'`,
+        { phase: "context/selection" },
+      );
+    }
+    if (
+      typeof value.label !== "string" ||
+      !value.label.trim() ||
+      value.label.length > 16 * 1024
+    ) {
+      throw new PrettyAuiError(
+        "INVALID_CONFIGURATION",
+        "Context selection labels must be non-empty bounded strings",
+        { phase: "context/selection" },
+      );
+    }
+    ids.add(value.id);
+    return Object.freeze({ id: value.id, label: value.label });
+  });
+  return Object.freeze(items);
+}
 
 function cleanSnapshot(input: object): ChatSnapshot {
   const result = { ...input } as Record<string, unknown>;
@@ -1061,8 +1769,127 @@ function withContextMeta(block: ContentBlock, item: ContextItem): ContentBlock {
     ...block,
     _meta: {
       ...(block._meta ?? {}),
-      "pretty-aui/context": { id: item.id, label: item.label },
+      "pretty-aui/context": {
+        version: 1,
+        id: item.id,
+        label: item.label,
+      },
     },
+  };
+}
+
+function canonicalContextBlock(value: unknown): ContentBlock {
+  if (!isRecord(value) || typeof value.type !== "string" || !value.type) {
+    throw new Error("Context content blocks require a type");
+  }
+  if (
+    isRecord(value._meta) &&
+    Object.hasOwn(value._meta, "pretty-aui/context")
+  ) {
+    throw new Error("Context blocks cannot use reserved pretty-aui metadata");
+  }
+  const base = canonicalContentBase(value);
+  switch (value.type) {
+    case "text":
+      if (typeof value.text !== "string")
+        throw new Error("Context text blocks require text");
+      return { ...base, type: "text", text: value.text };
+    case "image":
+    case "audio":
+      if (typeof value.data !== "string" || typeof value.mimeType !== "string")
+        throw new Error(
+          `Context ${value.type} blocks require data and mimeType`,
+        );
+      return {
+        ...base,
+        type: value.type,
+        data: value.data,
+        mimeType: value.mimeType,
+      };
+    case "resource_link":
+      if (typeof value.uri !== "string" || typeof value.name !== "string")
+        throw new Error("Context resource links require uri and name");
+      return {
+        ...base,
+        type: "resource_link",
+        uri: value.uri,
+        name: value.name,
+        ...(typeof value.title === "string" || value.title === null
+          ? { title: value.title }
+          : {}),
+        ...(typeof value.description === "string" || value.description === null
+          ? { description: value.description }
+          : {}),
+        ...(typeof value.mimeType === "string" || value.mimeType === null
+          ? { mimeType: value.mimeType }
+          : {}),
+        ...(typeof value.size === "number" && Number.isFinite(value.size)
+          ? { size: value.size }
+          : {}),
+        ...(Array.isArray(value.icons)
+          ? {
+              icons: value.icons.slice(0, 256).flatMap((icon) => {
+                const bounded = boundedRecord(icon);
+                return bounded ? [bounded] : [];
+              }),
+            }
+          : {}),
+      };
+    case "resource": {
+      if (!isRecord(value.resource) || typeof value.resource.uri !== "string")
+        throw new Error("Context resources require a uri");
+      const resource = value.resource;
+      const uri = resource.uri;
+      const resourceMetadata = boundedRecord(resource._meta);
+      return {
+        ...base,
+        type: "resource",
+        resource: {
+          uri,
+          ...(typeof resource.mimeType === "string" ||
+          resource.mimeType === null
+            ? { mimeType: resource.mimeType }
+            : {}),
+          ...(typeof resource.text === "string" ? { text: resource.text } : {}),
+          ...(typeof resource.blob === "string" ? { blob: resource.blob } : {}),
+          ...(resourceMetadata ? { _meta: resourceMetadata } : {}),
+        },
+      };
+    }
+    default: {
+      const bounded = boundedRecord(value);
+      return { ...(bounded ?? {}), ...base, type: value.type };
+    }
+  }
+}
+
+function canonicalContentBase(value: Record<string, unknown>): {
+  readonly annotations?: NonNullable<ContentBlock["annotations"]>;
+  readonly _meta?: Readonly<Record<string, unknown>>;
+} {
+  const metadata = boundedRecord(value._meta);
+  const annotations = isRecord(value.annotations)
+    ? {
+        ...(Array.isArray(value.annotations.audience)
+          ? {
+              audience: value.annotations.audience.filter(
+                (item): item is "user" | "assistant" =>
+                  item === "user" || item === "assistant",
+              ),
+            }
+          : {}),
+        ...(typeof value.annotations.priority === "number" &&
+        Number.isFinite(value.annotations.priority)
+          ? { priority: value.annotations.priority }
+          : {}),
+        ...(typeof value.annotations.lastModified === "string"
+          ? { lastModified: value.annotations.lastModified.slice(0, 16 * 1024) }
+          : {}),
+      }
+    : undefined;
+  return {
+    ...(annotations ? { annotations } : {}),
+    ...(metadata ? { _meta: metadata } : {}),
   };
 }
 

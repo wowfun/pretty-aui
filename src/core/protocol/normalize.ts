@@ -3,6 +3,7 @@ import type {
   ChatActivity,
   ChatCommand,
   ChatConfigOption,
+  ChatContextActivity,
   ChatMessage,
   ChatPlan,
   ChatPlanEntry,
@@ -237,6 +238,7 @@ export class TimelineStore {
   #counter = 0;
   #lastAnonymousMessage = new Map<string, string>();
   #pendingUserId: string | undefined;
+  #pendingContextIds = new Set<string>();
   #terminalState = new Map<
     string,
     {
@@ -255,11 +257,13 @@ export class TimelineStore {
     this.#activities = [];
     this.#lastAnonymousMessage.clear();
     this.#pendingUserId = undefined;
+    this.#pendingContextIds.clear();
     this.#terminalState.clear();
   }
 
   beginTurn(): void {
     this.#lastAnonymousMessage.clear();
+    this.#pendingContextIds.clear();
   }
 
   addUserMessage(content: readonly ContentBlock[], pending: boolean): string {
@@ -275,11 +279,28 @@ export class TimelineStore {
     return id;
   }
 
-  markUserAccepted(): void {
+  markUserAccepted(
+    contextItems: readonly {
+      readonly id: string;
+      readonly label: string;
+      readonly content: readonly ContentBlock[];
+    }[] = [],
+  ): void {
     if (!this.#pendingUserId) return;
     this.#replace(this.#pendingUserId, (activity) =>
       activity.type === "message" ? { ...activity, pending: false } : activity,
     );
+    for (const item of contextItems) {
+      const activity: ChatContextActivity = {
+        type: "context",
+        id: `local-context-${++this.#counter}`,
+        contextId: item.id,
+        label: item.label,
+        content: item.content,
+      };
+      this.#appendActivity(activity);
+    }
+    this.#pendingContextIds = new Set(contextItems.map((item) => item.id));
   }
 
   reduce(update: unknown, protocol: 1 | 2): ReducerEffect {
@@ -378,6 +399,13 @@ export class TimelineStore {
     content: unknown,
     protocol: 1 | 2,
   ): void {
+    if (
+      role === "user" &&
+      this.#pendingUserId &&
+      isSubmittedContextBlock(content, this.#pendingContextIds)
+    ) {
+      return;
+    }
     let wireId = messageId;
     if (!wireId && protocol === 1) {
       wireId =
@@ -394,6 +422,7 @@ export class TimelineStore {
       if (existing?.type === "message") {
         this.#replace(pendingId, () => ({ ...existing, id, pending: false }));
         this.#pendingUserId = undefined;
+        this.#pendingContextIds.clear();
       }
     }
     const existing = this.#activities.find(
@@ -425,7 +454,7 @@ export class TimelineStore {
       );
       if (pending?.type === "message") {
         const content = Object.hasOwn(update, "content")
-          ? normalizeContent(update.content)
+          ? normalizeUserEcho(update.content, this.#pendingContextIds)
           : pending.content;
         this.#replace(pendingId, () => ({
           ...pending,
@@ -434,6 +463,7 @@ export class TimelineStore {
           pending: false,
         }));
         this.#pendingUserId = undefined;
+        this.#pendingContextIds.clear();
         return;
       }
     }
@@ -682,6 +712,30 @@ export class TimelineStore {
       }
     }
   }
+}
+
+function normalizeUserEcho(
+  value: unknown,
+  contextIds: ReadonlySet<string>,
+): ContentBlock[] {
+  if (!Array.isArray(value)) return [];
+  return normalizeContent(
+    value.filter((block) => !isSubmittedContextBlock(block, contextIds)),
+  );
+}
+
+function isSubmittedContextBlock(
+  value: unknown,
+  contextIds: ReadonlySet<string>,
+): boolean {
+  if (!isRecord(value) || !isRecord(value._meta)) return false;
+  const marker = value._meta["pretty-aui/context"];
+  return (
+    isRecord(marker) &&
+    marker.version === 1 &&
+    typeof marker.id === "string" &&
+    contextIds.has(marker.id)
+  );
 }
 
 function messageActivityId(role: ChatMessage["role"], wireId: string): string {

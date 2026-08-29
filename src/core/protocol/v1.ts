@@ -220,7 +220,7 @@ export async function connectV1(
 
 class V1Driver implements ProtocolDriver {
   readonly version = 1 as const;
-  #modeOnly = false;
+  readonly #modeOnly = new Map<string, boolean>();
 
   constructor(
     private readonly connection: acp.ClientConnection,
@@ -241,7 +241,10 @@ class V1Driver implements ProtocolDriver {
       1,
       "session/new",
     );
-    this.#modeOnly = !response.configOptions?.length && Boolean(response.modes);
+    this.#modeOnly.set(
+      response.sessionId,
+      !response.configOptions?.length && Boolean(response.modes),
+    );
     return sessionFromResponse(
       response.sessionId,
       response.configOptions,
@@ -265,6 +268,10 @@ class V1Driver implements ProtocolDriver {
           ),
         1,
         "session/open",
+      );
+      this.#modeOnly.set(
+        sessionId,
+        !response.configOptions?.length && Boolean(response.modes),
       );
       return sessionFromResponse(
         sessionId,
@@ -290,6 +297,10 @@ class V1Driver implements ProtocolDriver {
         ),
       1,
       "session/open",
+    );
+    this.#modeOnly.set(
+      sessionId,
+      !response.configOptions?.length && Boolean(response.modes),
     );
     return sessionFromResponse(
       sessionId,
@@ -328,13 +339,22 @@ class V1Driver implements ProtocolDriver {
     await this.connection.agent.request(acp.methods.agent.session.delete, {
       sessionId,
     });
+    this.#modeOnly.delete(sessionId);
   }
 
   async closeSession(sessionId: string): Promise<void> {
-    if (!this.initialized.capabilities.closeSession) return;
+    if (!this.initialized.capabilities.closeSession) {
+      this.#modeOnly.delete(sessionId);
+      return;
+    }
     await this.connection.agent.request(acp.methods.agent.session.close, {
       sessionId,
     });
+    this.#modeOnly.delete(sessionId);
+  }
+
+  promptReady(_sessionId: string): boolean {
+    return true;
   }
 
   async prompt(
@@ -365,7 +385,11 @@ class V1Driver implements ProtocolDriver {
     id: string,
     value: string | boolean,
   ): Promise<readonly ChatConfigOption[]> {
-    if (this.#modeOnly && id === "mode" && typeof value === "string") {
+    if (
+      this.#modeOnly.get(sessionId) &&
+      id === "mode" &&
+      typeof value === "string"
+    ) {
       await this.connection.agent.request(acp.methods.agent.session.setMode, {
         sessionId,
         modeId: value,
@@ -405,10 +429,12 @@ class V1Driver implements ProtocolDriver {
 
   async logout(): Promise<void> {
     await this.connection.agent.request(acp.methods.agent.logout, {});
+    this.#modeOnly.clear();
   }
 
   async close(error?: unknown): Promise<void> {
     this.markClosed();
+    this.#modeOnly.clear();
     this.connection.close(error);
     await this.connection.closed;
   }

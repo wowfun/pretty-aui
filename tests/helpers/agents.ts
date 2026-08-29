@@ -27,6 +27,12 @@ export interface FakeAgentHarness {
   readonly permissionResponses: readonly unknown[];
   readonly elicitationResponses: readonly unknown[];
   readonly listSessionCursors: readonly (string | undefined)[];
+  readonly modeUpdates: readonly { sessionId: string; value: string }[];
+  readonly configUpdates: readonly {
+    sessionId: string;
+    id: string;
+    value: string | boolean;
+  }[];
   readonly newSessionRequests: number;
   readonly loadSessionRequests: number;
   readonly closedConnections: number;
@@ -45,6 +51,8 @@ export interface FakeAgentHarnessOptions {
     ((ordinal: number) => Promise<void>) | undefined;
   readonly beforeLoadSession?:
     ((sessionId: string) => Promise<void>) | undefined;
+  readonly beforeCloseSession?:
+    ((sessionId: string) => Promise<void>) | undefined;
   readonly beforePromptAck?: (() => Promise<void>) | undefined;
   readonly permissionSessionId?: string | undefined;
   readonly beforeElicitationComplete?: (() => Promise<void>) | undefined;
@@ -53,11 +61,14 @@ export interface FakeAgentHarnessOptions {
   readonly idleBeforePromptAck?: boolean | undefined;
   readonly omitIdleAfterPrompt?: boolean | undefined;
   readonly cancelWithoutIdle?: boolean | undefined;
+  readonly cancelIdleDelayMs?: number | undefined;
   readonly authenticationRequired?: boolean | undefined;
   readonly authenticationFailure?: boolean | undefined;
   readonly closeSessionFailure?: boolean | undefined;
   readonly logoutFailure?: boolean | undefined;
   readonly paginatedSessions?: boolean | undefined;
+  readonly modeOnlySessionOrdinals?: readonly number[] | undefined;
+  readonly usage?: { readonly used: number; readonly size: number } | undefined;
 }
 
 export function createV1Harness(
@@ -67,6 +78,12 @@ export function createV1Harness(
   const permissionResponses: unknown[] = [];
   const elicitationResponses: unknown[] = [];
   const listSessionCursors: (string | undefined)[] = [];
+  const modeUpdates: { sessionId: string; value: string }[] = [];
+  const configUpdates: {
+    sessionId: string;
+    id: string;
+    value: string | boolean;
+  }[] = [];
   const sessions = new Map<
     string,
     {
@@ -134,20 +151,34 @@ export function createV1Harness(
           elicitationId: `standalone-${sessionId}`,
           url: "https://example.com/finish",
         });
+      const modeOnly =
+        options.modeOnlySessionOrdinals?.includes(sessionCounter);
       return {
         sessionId,
-        configOptions: [
-          {
-            id: "model",
-            name: "Model",
-            type: "select" as const,
-            currentValue: "balanced",
-            options: [
-              { value: "fast", name: "Fast" },
-              { value: "balanced", name: "Balanced" },
-            ],
-          },
-        ],
+        ...(modeOnly
+          ? {
+              modes: {
+                currentModeId: "balanced",
+                availableModes: [
+                  { id: "fast", name: "Fast" },
+                  { id: "balanced", name: "Balanced" },
+                ],
+              },
+            }
+          : {
+              configOptions: [
+                {
+                  id: "model",
+                  name: "Model",
+                  type: "select" as const,
+                  currentValue: "balanced",
+                  options: [
+                    { value: "fast", name: "Fast" },
+                    { value: "balanced", name: "Balanced" },
+                  ],
+                },
+              ],
+            }),
       };
     })
     .onRequest(v1.methods.agent.authenticate, () => {
@@ -243,7 +274,8 @@ export function createV1Harness(
       };
     })
     .onRequest(v1.methods.agent.session.resume, () => ({}))
-    .onRequest(v1.methods.agent.session.close, () => {
+    .onRequest(v1.methods.agent.session.close, async ({ params }) => {
+      await options.beforeCloseSession?.(params.sessionId);
       if (options.closeSessionFailure) {
         throw v1.RequestError.internalError(
           undefined,
@@ -254,19 +286,30 @@ export function createV1Harness(
     .onRequest(v1.methods.agent.session.delete, ({ params }) => {
       sessions.delete(params.sessionId);
     })
-    .onRequest(v1.methods.agent.session.setConfigOption, ({ params }) => ({
-      configOptions: [
-        {
-          id: params.configId,
-          name: "Model",
-          type: "select" as const,
-          currentValue: String(params.value),
-          options: [
-            { value: String(params.value), name: String(params.value) },
-          ],
-        },
-      ],
-    }))
+    .onRequest(v1.methods.agent.session.setMode, ({ params }) => {
+      modeUpdates.push({ sessionId: params.sessionId, value: params.modeId });
+      return {};
+    })
+    .onRequest(v1.methods.agent.session.setConfigOption, ({ params }) => {
+      configUpdates.push({
+        sessionId: params.sessionId,
+        id: params.configId,
+        value: params.value,
+      });
+      return {
+        configOptions: [
+          {
+            id: params.configId,
+            name: "Model",
+            type: "select" as const,
+            currentValue: String(params.value),
+            options: [
+              { value: String(params.value), name: String(params.value) },
+            ],
+          },
+        ],
+      };
+    })
     .onRequest(v1.methods.agent.session.prompt, async ({ params, client }) => {
       const prompt = params.prompt as ContentBlock[];
       prompts.push({
@@ -281,6 +324,16 @@ export function createV1Harness(
           update: {
             sessionUpdate: "session_info_update",
             title: session.title,
+          },
+        });
+      }
+      if (options.usage) {
+        await client.notify(v1.methods.client.session.update, {
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: "usage_update",
+            used: options.usage.used,
+            size: options.usage.size,
           },
         });
       }
@@ -483,6 +536,8 @@ export function createV1Harness(
     permissionResponses,
     elicitationResponses,
     listSessionCursors,
+    modeUpdates,
+    configUpdates,
     get newSessionRequests() {
       return newSessionRequests;
     },
@@ -504,6 +559,7 @@ export function createV2Harness(
     | "beforeElicitationComplete"
     | "beforeListSessions"
     | "beforePromptAck"
+    | "cancelIdleDelayMs"
     | "cancelWithoutIdle"
     | "idleBeforePromptAck"
     | "omitIdleAfterPrompt"
@@ -670,14 +726,20 @@ export function createV2Harness(
     })
     .onNotification(v2.methods.agent.session.cancel, ({ params, client }) => {
       if (options.cancelWithoutIdle) return;
-      void client.notify(v2.methods.client.session.update, {
-        sessionId: params.sessionId,
-        update: {
-          sessionUpdate: "state_update",
-          state: "idle",
-          stopReason: "cancelled",
-        },
-      });
+      const notifyIdle = () =>
+        client.notify(v2.methods.client.session.update, {
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: "state_update",
+            state: "idle",
+            stopReason: "cancelled",
+          },
+        });
+      if (options.cancelIdleDelayMs !== undefined) {
+        setTimeout(() => void notifyIdle(), options.cancelIdleDelayMs);
+      } else {
+        void notifyIdle();
+      }
     });
   return harnessFor(app as unknown as AppLike, prompts, {
     elicitationResponses,
@@ -692,6 +754,12 @@ function harnessFor(
     readonly permissionResponses?: readonly unknown[];
     readonly elicitationResponses?: readonly unknown[];
     readonly listSessionCursors?: readonly (string | undefined)[];
+    readonly modeUpdates?: readonly { sessionId: string; value: string }[];
+    readonly configUpdates?: readonly {
+      sessionId: string;
+      id: string;
+      value: string | boolean;
+    }[];
     readonly newSessionRequests?: number;
     readonly loadSessionRequests?: number;
     readonly requestStandaloneElicitation?:
@@ -735,6 +803,12 @@ function harnessFor(
     },
     get listSessionCursors() {
       return observations.listSessionCursors ?? [];
+    },
+    get modeUpdates() {
+      return observations.modeUpdates ?? [];
+    },
+    get configUpdates() {
+      return observations.configUpdates ?? [];
     },
     get newSessionRequests() {
       return observations.newSessionRequests ?? 0;

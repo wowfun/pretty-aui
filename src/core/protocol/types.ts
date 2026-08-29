@@ -1,3 +1,4 @@
+import { RequestError } from "@agentclientprotocol/sdk";
 import { PrettyAuiError } from "../errors.js";
 import type {
   AcpProtocolVersion,
@@ -12,6 +13,7 @@ import type {
   McpServer,
   PermissionDecision,
   PermissionInteraction,
+  PromptCapabilities,
   SessionOptions,
   SessionPage,
 } from "../types.js";
@@ -22,12 +24,6 @@ export interface ProtocolSession {
   readonly configOptions: readonly ChatConfigOption[];
   readonly commands?: readonly ChatCommand[];
   readonly historyGap?: boolean;
-}
-
-export interface PromptCapabilities {
-  readonly image: boolean;
-  readonly audio: boolean;
-  readonly embeddedContext: boolean;
 }
 
 export interface ProtocolInitialization {
@@ -73,6 +69,8 @@ export interface ProtocolDriver {
   listSessions(cwd: string, cursor?: string): Promise<SessionPage>;
   deleteSession(sessionId: string): Promise<void>;
   closeSession(sessionId: string): Promise<void>;
+  /** Whether protocol state can safely correlate a new prompt for the session. */
+  promptReady(sessionId: string): boolean;
   prompt(
     sessionId: string,
     prompt: readonly ContentBlock[],
@@ -182,14 +180,19 @@ export async function requestSessionWithAuthMapping<Value>(
   try {
     return await request();
   } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === -32000) {
+    if (!(error instanceof RequestError)) throw error;
+    if (error.code === -32000) {
       throw new PrettyAuiError(
         "AUTHENTICATION_REQUIRED",
         "The agent requires authentication for this session operation",
         { cause: error, protocol, phase },
       );
     }
-    throw error;
+    throw new PrettyAuiError(
+      "SESSION_REJECTED",
+      `The agent rejected ${phase}`,
+      { cause: error, protocol, phase, retryable: phase === "session/open" },
+    );
   }
 }
 

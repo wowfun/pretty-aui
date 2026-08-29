@@ -5,6 +5,30 @@ import {
 } from "../../src/core/index.js";
 
 describe("built-in connector boundaries", () => {
+  it("omits an undefined browser WebSocket subprotocol", async () => {
+    const protocols: (string | string[] | undefined)[] = [];
+    const owner = new AbortController();
+    const connector = createWebSocketConnector("ws://127.0.0.1/acp", {
+      WebSocket: class extends FakeWebSocket {
+        constructor(
+          _url: string,
+          value?: string | string[],
+          _options?: { headers?: Record<string, string> },
+        ) {
+          super();
+          protocols.push(value);
+        }
+      },
+    });
+
+    await open(
+      connector.open({ protocol: 1, attempt: 1, signal: owner.signal }),
+    );
+    owner.abort();
+
+    expect(protocols).toEqual([[]]);
+  });
+
   it("closes a WebSocket transport when its owning signal aborts", async () => {
     const sockets: FakeWebSocket[] = [];
     const connector = createWebSocketConnector("ws://127.0.0.1/acp", {
@@ -138,6 +162,30 @@ describe("built-in connector boundaries", () => {
     await expect(reader.read()).rejects.toMatchObject({
       code: "PROTOCOL_VIOLATION",
     });
+  });
+
+  it("rejects an outbound decoded wire message larger than 2 MiB", async () => {
+    const connector = createWebSocketConnector("ws://127.0.0.1/acp", {
+      WebSocket: FakeWebSocket,
+    });
+    const owner = new AbortController();
+    const stream = await open(
+      connector.open({ protocol: 1, attempt: 1, signal: owner.signal }),
+    );
+    const writer = stream.writable.getWriter();
+
+    await expect(
+      writer.write({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "session/prompt",
+        params: { text: "x".repeat(2 * 1024 * 1024) },
+      }),
+    ).rejects.toMatchObject({
+      code: "PROTOCOL_VIOLATION",
+      phase: "transport/output",
+    });
+    owner.abort();
   });
 
   it("measures decoded wire string budgets in UTF-8 bytes", async () => {

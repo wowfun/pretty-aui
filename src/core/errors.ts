@@ -3,6 +3,7 @@ import type { AcpProtocolVersion, ChatErrorState } from "./types.js";
 export type PrettyAuiErrorCode =
   | "AUTO_NEGOTIATION_REQUIRES_FACTORY"
   | "AUTHENTICATION_REQUIRED"
+  | "AUTHENTICATION_DISABLED"
   | "CAPABILITY_REQUIRED"
   | "CONNECTION_CLOSED"
   | "CONTEXT_FAILED"
@@ -13,7 +14,9 @@ export type PrettyAuiErrorCode =
   | "PROTOCOL_VERSION_MISMATCH"
   | "PROTOCOL_VIOLATION"
   | "SESSION_BUSY"
+  | "SESSION_LIMIT"
   | "SESSION_NOT_READY"
+  | "SESSION_REJECTED"
   | "TURN_INTERRUPTED"
   | "UNSUPPORTED_PROTOCOL";
 

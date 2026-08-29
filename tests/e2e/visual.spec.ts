@@ -74,6 +74,36 @@ test("permission interaction matches the reviewed baseline", async ({
   await page.getByRole("button", { name: "Reject" }).click();
 });
 
+test("concurrent session states match the reviewed baseline", async ({
+  page,
+}) => {
+  await page.goto("/?scheme=light&subagentDelay=5000");
+  const composer = page.getByLabel("Ask anything…");
+  await expect(composer).toBeEnabled();
+
+  await composer.fill("Use a subagent to inspect the client");
+  await composer.press("Enter");
+  await expect(page.locator('[data-kind="subagent"]')).toBeVisible();
+
+  await page.getByRole("button", { name: "New chat" }).click();
+  await composer.fill("permission");
+  await composer.press("Enter");
+  await expect(
+    page.getByRole("alertdialog", { name: "Read project notes" }),
+  ).toBeVisible();
+
+  await page.getByRole("button", { name: "New chat" }).click();
+  await page.getByRole("button", { name: "Sessions" }).click();
+  await expect(page.getByText("Running", { exact: true })).toBeVisible();
+  await expect(
+    page.locator(".paui-session__meta").filter({ hasText: "Awaiting User" }),
+  ).toBeVisible();
+  await expect(page.getByText("Idle", { exact: true })).toBeVisible();
+  await expect(chat(page)).toHaveScreenshot("concurrent-sessions-light.png", {
+    animations: "disabled",
+  });
+});
+
 test("streaming thought row matches the reviewed DSH baseline", async ({
   page,
 }) => {
@@ -89,6 +119,83 @@ test("streaming thought row matches the reviewed DSH baseline", async ({
   await expect(chat(page)).toHaveScreenshot("streaming-thought-light.png", {
     animations: "disabled",
   });
+});
+
+test("collapsed Context injection matches the reviewed baseline", async ({
+  page,
+}) => {
+  await openContext(page);
+  await expect(chat(page)).toHaveScreenshot(
+    "context-injection-collapsed-light.png",
+    { animations: "disabled" },
+  );
+});
+
+test("expanded Context injection matches the reviewed baseline", async ({
+  page,
+}) => {
+  await openContext(page);
+  const summary = page.locator('[data-kind="context"] summary');
+  await summary.focus();
+  await summary.press("Enter");
+  await expect(page.locator('[data-kind="context"] details')).toHaveAttribute(
+    "open",
+    "",
+  );
+  await expect(page.locator(".paui-context-injection__body")).toHaveCSS(
+    "max-height",
+    "141px",
+  );
+  await expect(page.locator(".paui-context-injection__body")).toHaveCSS(
+    "overflow-y",
+    "auto",
+  );
+  await centerContext(page);
+  await expect(chat(page)).toHaveScreenshot(
+    "context-injection-expanded-light.png",
+    { animations: "disabled" },
+  );
+});
+
+test("narrow Context injection matches the reviewed baseline", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await openContext(page);
+  await page.locator('[data-kind="context"] summary').click();
+  await centerContext(page);
+  await expect(chat(page)).toHaveScreenshot(
+    "context-injection-narrow-light.png",
+    { animations: "disabled" },
+  );
+});
+
+test("multiple composer contexts match the reviewed baseline", async ({
+  page,
+}) => {
+  await page.goto("/?scheme=light&composerContext=1");
+  await expect(page.getByLabel("Ask anything…")).toBeEnabled();
+  await expect(
+    page.locator('[data-pretty-aui-slot="composer-context-item"]'),
+  ).toHaveCount(2);
+  await expect(chat(page)).toHaveScreenshot("composer-context-light.png", {
+    animations: "disabled",
+  });
+});
+
+test("multiple composer contexts wrap on a narrow surface", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/?scheme=light&composerContext=1");
+  await expect(page.getByLabel("Ask anything…")).toBeEnabled();
+  await expect(
+    page.locator('[data-pretty-aui-slot="composer-context-item"]'),
+  ).toHaveCount(2);
+  await expect(chat(page)).toHaveScreenshot(
+    "composer-context-narrow-light.png",
+    { animations: "disabled" },
+  );
 });
 
 test("streaming Agent row matches the reviewed DSH baseline", async ({
@@ -156,4 +263,21 @@ async function openAgent(page: Page) {
   await composer.press("Enter");
   await expect(page.locator('[data-kind="subagent"]')).toBeVisible();
   await expect(page.getByText("Observed 0s")).toBeVisible();
+}
+
+async function openContext(page: Page) {
+  await page.goto("/?scheme=light&context=1");
+  const composer = page.getByLabel("Ask anything…");
+  await expect(composer).toBeEnabled();
+  await composer.fill("Review the injected evidence.");
+  await composer.press("Enter");
+  await expect(page.locator('[data-kind="context"]')).toBeVisible();
+  await expect(page.getByText("Ready", { exact: true })).toBeVisible();
+  await centerContext(page);
+}
+
+async function centerContext(page: Page) {
+  await page.locator('[data-kind="context"]').evaluate((element) => {
+    element.scrollIntoView({ block: "center" });
+  });
 }

@@ -20,6 +20,7 @@ import {
 import { createChat } from "../core/chat-controller.js";
 import type {
   ChatActivity,
+  ChatContextActivity,
   ChatController,
   ChatOptions,
   ChatSnapshot,
@@ -27,6 +28,7 @@ import type {
   ContentBlock,
   ElicitationInteraction,
   PermissionInteraction,
+  SessionInfo,
 } from "../core/types.js";
 import { defaultLabels } from "./types.js";
 import type {
@@ -55,12 +57,18 @@ let controllerKeyCounter = 0;
 
 const CONNECTING_SNAPSHOT: ChatSnapshot = {
   phase: "connecting",
+  loadedSessions: [],
   sessionTrail: [],
   historyGap: false,
   activities: [],
-  contextItems: [],
   configOptions: [],
   commands: [],
+  contextSelection: {
+    items: [],
+    canAdd: false,
+    canRemove: false,
+    busy: false,
+  },
   interactions: [],
   authMethods: [],
   capabilities: {
@@ -80,6 +88,8 @@ const CONNECTING_CONTROLLER: ChatController = {
     throw new Error("The chat session is still connecting");
   },
   async cancel() {},
+  async addContext() {},
+  async removeContext() {},
   async reconnect() {},
   async newSession() {},
   async listSessions() {
@@ -250,6 +260,12 @@ export function ChatHeader() {
   const [sessionsOpen, setSessionsOpen] = useState(false);
   const currentTitle = snapshot.sessionTitle ?? labels.sessionUntitled;
   const parent = snapshot.sessionTrail.at(-1);
+  const canCreateSession =
+    snapshot.protocolVersion !== undefined &&
+    snapshot.phase !== "connecting" &&
+    snapshot.phase !== "auth_required" &&
+    snapshot.phase !== "closed" &&
+    snapshot.loadedSessions.length < 16;
   return (
     <>
       <header className="paui-header" data-pretty-aui-slot="header">
@@ -324,7 +340,13 @@ export function ChatHeader() {
           )}
         </div>
         <div className="paui-header__actions">
-          {snapshot.capabilities.listSessions ? (
+          {snapshot.usage ? (
+            <span className="paui-usage">
+              {labels.usage(snapshot.usage.used, snapshot.usage.size)}
+            </span>
+          ) : null}
+          {snapshot.capabilities.listSessions ||
+          snapshot.loadedSessions.length > 1 ? (
             <button
               className="paui-icon-button"
               type="button"
@@ -337,7 +359,7 @@ export function ChatHeader() {
           <button
             className="paui-icon-button"
             type="button"
-            disabled={snapshot.phase !== "idle"}
+            disabled={!canCreateSession}
             onClick={() => runAction(() => controller.newSession())}
           >
             <NewChatIcon />
@@ -365,6 +387,14 @@ export function ChatTranscript() {
   const contentRef = useRef<HTMLDivElement>(null);
   const pinnedRef = useRef(true);
   const lastScrollTopRef = useRef(0);
+  const sessionKey = sessionCacheKey(snapshot);
+  const sessionRef = useRef(sessionKey);
+  const sessionScrollRef = useRef(
+    new Map<
+      string | undefined,
+      { readonly top: number; readonly pinned: boolean }
+    >(),
+  );
   const [pinned, setPinned] = useState(true);
   const scrollToBottom = useCallback((behavior: ScrollBehavior = "auto") => {
     const scroller = scrollerRef.current;
@@ -387,8 +417,33 @@ export function ChatTranscript() {
     const next = distance <= 24 ? true : movedUp ? false : pinnedRef.current;
     lastScrollTopRef.current = scroller.scrollTop;
     pinnedRef.current = next;
+    sessionScrollRef.current.set(sessionKey, {
+      top: scroller.scrollTop,
+      pinned: next,
+    });
     setPinned(next);
-  }, []);
+  }, [sessionKey]);
+
+  useLayoutEffect(() => {
+    const previousSessionKey = sessionRef.current;
+    if (previousSessionKey === sessionKey) return;
+    const scroller = scrollerRef.current;
+    if (!scroller) return;
+    sessionScrollRef.current.set(previousSessionKey, {
+      top: scroller.scrollTop,
+      pinned: pinnedRef.current,
+    });
+    sessionRef.current = sessionKey;
+    const restored = sessionScrollRef.current.get(sessionKey);
+    if (restored) {
+      scroller.scrollTop = restored.top;
+      lastScrollTopRef.current = restored.top;
+      pinnedRef.current = restored.pinned;
+      setPinned(restored.pinned);
+    } else {
+      scrollToBottom();
+    }
+  }, [scrollToBottom, sessionKey]);
 
   useLayoutEffect(() => {
     if (pinnedRef.current) scrollToBottom();
@@ -410,56 +465,60 @@ export function ChatTranscript() {
     [snapshot.activities],
   );
   return (
-    <main
-      ref={scrollerRef}
-      className="paui-body"
-      data-pretty-aui-slot="transcript"
-      tabIndex={0}
-      onScroll={updatePinned}
-    >
-      <div className="paui-transcript" ref={contentRef}>
-        {snapshot.historyGap ? (
-          <aside className="paui-notice" role="status">
-            <InfoIcon />
-            <div>
-              <strong>{labels.historyGapTitle}</strong>
-              <span>{labels.historyGap}</span>
+    <>
+      <main
+        ref={scrollerRef}
+        className="paui-body"
+        data-pretty-aui-slot="transcript"
+        tabIndex={0}
+        onScroll={updatePinned}
+      >
+        <div className="paui-transcript" ref={contentRef}>
+          {snapshot.historyGap ? (
+            <aside className="paui-notice" role="status">
+              <InfoIcon />
+              <div>
+                <strong>{labels.historyGapTitle}</strong>
+                <span>{labels.historyGap}</span>
+              </div>
+            </aside>
+          ) : null}
+          {!snapshot.activities.length ? (
+            <div className="paui-empty">
+              <SparkIcon />
+              <strong>{labels.emptyTitle}</strong>
+              <p>{labels.emptyDescription}</p>
             </div>
-          </aside>
-        ) : null}
-        {!snapshot.activities.length ? (
-          <div className="paui-empty">
-            <SparkIcon />
-            <strong>{labels.emptyTitle}</strong>
-            <p>{labels.emptyDescription}</p>
-          </div>
-        ) : null}
-        {groups.map((group, index) => (
-          <TurnGroup
-            key={group.id}
-            group={group}
-            labels={labels}
-            toolActivityRenderer={toolActivityRenderer}
-            active={
-              index === groups.length - 1 &&
-              (snapshot.phase === "running" ||
-                snapshot.phase === "awaiting_user" ||
-                snapshot.phase === "cancelling")
-            }
-          />
-        ))}
-      </div>
+          ) : null}
+          {groups.map((group, index) => (
+            <TurnGroup
+              key={group.id}
+              group={group}
+              labels={labels}
+              toolActivityRenderer={toolActivityRenderer}
+              active={
+                index === groups.length - 1 &&
+                (snapshot.phase === "running" ||
+                  snapshot.phase === "awaiting_user" ||
+                  snapshot.phase === "cancelling")
+              }
+            />
+          ))}
+        </div>
+      </main>
       {!pinned ? (
-        <button
-          className="paui-to-bottom"
-          type="button"
-          onClick={() => scrollToBottom("smooth")}
-          aria-label="Scroll to latest message"
-        >
-          <DownIcon />
-        </button>
+        <div className="paui-to-bottom-row">
+          <button
+            className="paui-to-bottom"
+            type="button"
+            onClick={() => scrollToBottom("smooth")}
+            aria-label={labels.scrollToLatest}
+          >
+            <DownIcon />
+          </button>
+        </div>
       ) : null}
-    </main>
+    </>
   );
 }
 
@@ -646,6 +705,8 @@ function ActivityView({
       return (
         <MessageView message={activity} labels={labels} running={running} />
       );
+    case "context":
+      return <ContextActivity activity={activity} labels={labels} />;
     case "tool":
       if (activity.subagent) {
         return (
@@ -684,7 +745,7 @@ function ActivityView({
         <details className="paui-disclosure paui-plan" open>
           <summary>
             <PlanIcon />
-            <span>Plan</span>
+            <span>{labels.plan}</span>
             <StatusBadge status={planStatus(activity.entries)} />
           </summary>
           <ol className="paui-plan__list">
@@ -717,6 +778,133 @@ function ActivityView({
         </div>
       );
   }
+}
+
+function ContextActivity({
+  activity,
+  labels,
+}: {
+  readonly activity: ChatContextActivity;
+  readonly labels: ChatLabels;
+}) {
+  return (
+    <details className="paui-disclosure paui-context-injection">
+      <summary className="paui-flow-summary">
+        <DisclosureLeading icon={<ContextIcon />} />
+        <span className="paui-flow-title">{labels.contextInjection}</span>
+        <span className="paui-flow-separator" aria-hidden="true" />
+        <span className="paui-flow-preview">{activity.label}</span>
+      </summary>
+      <div className="paui-context-injection__body" tabIndex={0}>
+        {activity.content.map((block, index) => (
+          <ContextBlockView
+            block={block}
+            labels={labels}
+            key={`${activity.id}:${index}`}
+          />
+        ))}
+      </div>
+    </details>
+  );
+}
+
+function ContextBlockView({
+  block,
+  labels,
+}: {
+  readonly block: ContentBlock;
+  readonly labels: ChatLabels;
+}) {
+  if (block.type === "text" && typeof block.text === "string") {
+    return <ContextLiteralText text={block.text} labels={labels} />;
+  }
+  if (block.type === "resource" && isRecord(block.resource)) {
+    const resource = block.resource;
+    return (
+      <section className="paui-context-block">
+        <div className="paui-context-meta">
+          <span>{String(resource.uri ?? labels.resource)}</span>
+          {typeof resource.mimeType === "string" ? (
+            <span>{resource.mimeType}</span>
+          ) : null}
+        </div>
+        {typeof resource.text === "string" ? (
+          <ContextLiteralText text={resource.text} labels={labels} />
+        ) : typeof resource.blob === "string" ? (
+          <span className="paui-muted">
+            {`Binary resource · ${resource.blob.length.toLocaleString()} base64 characters`}
+          </span>
+        ) : null}
+      </section>
+    );
+  }
+  if (block.type === "resource_link" && typeof block.uri === "string") {
+    const title =
+      typeof block.title === "string"
+        ? block.title
+        : typeof block.name === "string"
+          ? block.name
+          : labels.resource;
+    const mimeType =
+      typeof block.mimeType === "string" ? block.mimeType : undefined;
+    const description =
+      typeof block.description === "string" ? block.description : undefined;
+    return (
+      <section className="paui-context-block">
+        <div className="paui-context-meta">
+          <span>{title}</span>
+          {mimeType ? <span>{mimeType}</span> : null}
+        </div>
+        <span className="paui-context-identifier">{block.uri}</span>
+        {description ? <span>{description}</span> : null}
+      </section>
+    );
+  }
+  if (
+    (block.type === "image" || block.type === "audio") &&
+    typeof block.mimeType === "string" &&
+    typeof block.data === "string"
+  ) {
+    return (
+      <span className="paui-context-meta">
+        {`${flowTitle(block.type, block.type)} · ${block.mimeType} · ${block.data.length.toLocaleString()} base64 characters`}
+      </span>
+    );
+  }
+  return (
+    <ContextLiteralText text={formatRawToolValue(block)} labels={labels} />
+  );
+}
+
+function ContextLiteralText({
+  text,
+  labels,
+}: {
+  readonly text: string;
+  readonly labels: ChatLabels;
+}) {
+  const bounded = boundContextText(text);
+  return (
+    <>
+      <pre className="paui-context-text">{bounded.text}</pre>
+      {bounded.truncated ? (
+        <span className="paui-context-truncated">
+          {labels.contextTruncated(text.length)}
+        </span>
+      ) : null}
+    </>
+  );
+}
+
+function boundContextText(text: string): {
+  readonly text: string;
+  readonly truncated: boolean;
+} {
+  if (text.length <= 20_000) return { text, truncated: false };
+  let end = 20_000;
+  const last = text.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+  return { text: text.slice(0, end), truncated: true };
 }
 
 function SubagentActivity({
@@ -1016,12 +1204,29 @@ function DefaultToolBody({
   tool: ChatToolCall;
   labels: ChatLabels;
 }) {
-  return tool.content.length ? (
-    tool.content.map((content, index) => (
+  if (tool.content.length) {
+    return tool.content.map((content, index) => (
       <ToolContentView key={index} value={content} labels={labels} />
-    ))
-  ) : (
-    <span className="paui-muted">{labels.tool}</span>
+    ));
+  }
+  if (tool.rawInput === undefined && tool.rawOutput === undefined) {
+    return <span className="paui-muted">{labels.tool}</span>;
+  }
+  return (
+    <div className="paui-tool-raw">
+      {tool.rawInput !== undefined ? (
+        <section>
+          <strong>{labels.toolInput}</strong>
+          <pre>{formatRawToolValue(tool.rawInput)}</pre>
+        </section>
+      ) : null}
+      {tool.rawOutput !== undefined ? (
+        <section>
+          <strong>{labels.toolOutput}</strong>
+          <pre>{formatRawToolValue(tool.rawOutput)}</pre>
+        </section>
+      ) : null}
+    </div>
   );
 }
 
@@ -1138,13 +1343,14 @@ function ContentView({
       </a>
     ) : (
       <span className="paui-unsupported">
-        {labels.unsupportedContent("unsafe resource link")}
+        {labels.unsupportedContent(labels.unsafeResourceLink)}
       </span>
     );
   }
   if (block.type === "resource" && isRecord(block.resource)) {
     const resource = block.resource;
-    const uri = typeof resource.uri === "string" ? resource.uri : "Resource";
+    const uri =
+      typeof resource.uri === "string" ? resource.uri : labels.resource;
     if (typeof resource.text === "string") {
       return (
         <details className="paui-resource">
@@ -1188,7 +1394,8 @@ function ToolContentView({
     );
   }
   if (value.type === "diff") {
-    const path = typeof value.path === "string" ? value.path : "Changed files";
+    const path =
+      typeof value.path === "string" ? value.path : labels.changedFiles;
     const patch =
       typeof value.patch === "string"
         ? value.patch
@@ -1204,7 +1411,7 @@ function ToolContentView({
         {patch ? (
           <pre>{patch}</pre>
         ) : (
-          <span className="paui-muted">Binary or structural change</span>
+          <span className="paui-muted">{labels.binaryChange}</span>
         )}
       </details>
     );
@@ -1212,14 +1419,14 @@ function ToolContentView({
   if (value.type === "terminal") {
     return (
       <span className="paui-muted">
-        <TerminalIcon /> Terminal output is shown in the activity stream.
+        <TerminalIcon /> {labels.terminalOutputInActivity}
       </span>
     );
   }
   return (
     <span className="paui-unsupported">
       {labels.unsupportedContent(
-        typeof value.type === "string" ? value.type : "tool result",
+        typeof value.type === "string" ? value.type : labels.toolResult,
       )}
     </span>
   );
@@ -1234,7 +1441,9 @@ export function ChatComposer() {
   const [commandsDismissed, setCommandsDismissed] = useState(false);
   const composingRef = useRef(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const sessionRef = useRef(snapshot.sessionId);
+  const sessionKey = sessionCacheKey(snapshot);
+  const sessionRef = useRef(sessionKey);
+  const draftsRef = useRef(new Map<string | undefined, string>());
   const placement =
     snapshot.activities.length ||
     snapshot.interactions.length ||
@@ -1243,12 +1452,18 @@ export function ChatComposer() {
       ? "docked"
       : "hero";
   useEffect(() => {
-    if (sessionRef.current !== snapshot.sessionId) {
-      const previousSessionId = sessionRef.current;
-      sessionRef.current = snapshot.sessionId;
-      if (previousSessionId !== undefined) setValue("");
+    if (sessionRef.current !== sessionKey) {
+      const previousSessionKey = sessionRef.current;
+      draftsRef.current.set(previousSessionKey, value);
+      sessionRef.current = sessionKey;
+      let restored = draftsRef.current.get(sessionKey);
+      if (previousSessionKey === undefined && restored === undefined) {
+        restored = value;
+        draftsRef.current.set(sessionKey, value);
+      }
+      setValue(restored ?? "");
     }
-  }, [snapshot.sessionId]);
+  }, [sessionKey, value]);
   useLayoutEffect(() => {
     const textarea = textareaRef.current;
     if (!textarea) return;
@@ -1267,15 +1482,21 @@ export function ChatComposer() {
   const submit = () => {
     const prompt = value.trim();
     if (!prompt || disabled || running) return;
+    const ownerSessionKey = sessionKey;
+    draftsRef.current.set(ownerSessionKey, "");
     setValue("");
     setCommandsDismissed(true);
     try {
       const turn = controller.send(prompt);
       void turn.done.catch(() => {
-        setValue((current) => current || prompt);
+        if (!draftsRef.current.get(ownerSessionKey)) {
+          draftsRef.current.set(ownerSessionKey, prompt);
+          if (sessionRef.current === ownerSessionKey) setValue(prompt);
+        }
       });
     } catch {
-      setValue(prompt);
+      draftsRef.current.set(ownerSessionKey, prompt);
+      if (sessionRef.current === ownerSessionKey) setValue(prompt);
     }
   };
   const matchingCommands =
@@ -1291,7 +1512,9 @@ export function ChatComposer() {
     Math.max(0, matchingCommands.length - 1),
   );
   const chooseCommand = (name: string) => {
-    setValue(`/${name} `);
+    const command = `/${name} `;
+    draftsRef.current.set(sessionKey, command);
+    setValue(command);
     setCommandsDismissed(true);
     textareaRef.current?.focus();
   };
@@ -1334,22 +1557,12 @@ export function ChatComposer() {
       data-pretty-aui-slot="composer"
       data-placement={placement}
     >
-      {snapshot.contextItems.length ? (
-        <div className="paui-context" aria-label={labels.context}>
-          {snapshot.contextItems.map((item) => (
-            <span key={item.id}>
-              <ContextIcon />
-              {item.label}
-            </span>
-          ))}
-        </div>
-      ) : null}
       {matchingCommands.length ? (
         <div
           className="paui-commands"
           role="listbox"
           id={commandsId}
-          aria-label="Commands"
+          aria-label={labels.commands}
         >
           {matchingCommands.map((command, index) => (
             <button
@@ -1368,6 +1581,55 @@ export function ChatComposer() {
         </div>
       ) : null}
       <div className="paui-composer" data-pretty-aui-slot="composer-input">
+        {snapshot.contextSelection.items.length ||
+        snapshot.contextSelection.canAdd ? (
+          <div
+            className="paui-composer__context"
+            data-pretty-aui-slot="composer-context"
+            role="group"
+            aria-label={labels.contextSelection}
+          >
+            {snapshot.contextSelection.canAdd ? (
+              <button
+                className="paui-context-add"
+                type="button"
+                aria-label={labels.addContext}
+                title={labels.addContext}
+                disabled={disabled || running || snapshot.contextSelection.busy}
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => runAction(() => controller.addContext())}
+              >
+                <span aria-hidden="true">+</span>
+              </button>
+            ) : null}
+            {snapshot.contextSelection.items.map((item) => (
+              <span
+                className="paui-context-chip"
+                data-pretty-aui-slot="composer-context-item"
+                key={item.id}
+                title={item.label}
+              >
+                <span className="paui-context-chip__label">{item.label}</span>
+                {snapshot.contextSelection.canRemove ? (
+                  <button
+                    type="button"
+                    aria-label={labels.removeContext(item.label)}
+                    title={labels.removeContext(item.label)}
+                    disabled={
+                      disabled || running || snapshot.contextSelection.busy
+                    }
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={() =>
+                      runAction(() => controller.removeContext(item.id))
+                    }
+                  >
+                    <span aria-hidden="true">×</span>
+                  </button>
+                ) : null}
+              </span>
+            ))}
+          </div>
+        ) : null}
         <textarea
           ref={textareaRef}
           rows={1}
@@ -1386,7 +1648,9 @@ export function ChatComposer() {
               : undefined
           }
           onInput={(event) => {
-            setValue(event.currentTarget.value);
+            const nextValue = event.currentTarget.value;
+            draftsRef.current.set(sessionKey, nextValue);
+            setValue(nextValue);
             setCommandIndex(0);
             setCommandsDismissed(false);
           }}
@@ -1804,6 +2068,7 @@ function SessionDrawer({
   const dialogRef = useRef<HTMLElement>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>();
+  const sessions = mergeDrawerSessions(snapshot);
   useEffect(() => {
     const activeElement = activeElementFor(dialogRef.current);
     const previousFocus =
@@ -1814,7 +2079,7 @@ function SessionDrawer({
     };
   }, []);
   useEffect(() => {
-    if (!snapshot.sessions) {
+    if (snapshot.capabilities.listSessions && !snapshot.sessions) {
       setLoading(true);
       void controller
         .listSessions()
@@ -1823,7 +2088,7 @@ function SessionDrawer({
         )
         .finally(() => setLoading(false));
     }
-  }, [controller, snapshot.sessions]);
+  }, [controller, snapshot.capabilities.listSessions, snapshot.sessions]);
   useEffect(() => {
     const onKey = (event: globalThis.KeyboardEvent) => {
       if (event.key === "Escape") {
@@ -1883,6 +2148,17 @@ function SessionDrawer({
       setLoading(false);
     }
   };
+  const closeSession = async (sessionId: string) => {
+    setLoading(true);
+    setError(undefined);
+    try {
+      await controller.closeSession(sessionId);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setLoading(false);
+    }
+  };
   return (
     <div
       className="paui-drawer-backdrop"
@@ -1914,10 +2190,10 @@ function SessionDrawer({
           {loading && !snapshot.sessions ? (
             <span className="paui-muted">…</span>
           ) : null}
-          {!loading && !snapshot.sessions?.sessions.length ? (
+          {!loading && !sessions.length ? (
             <span className="paui-muted">{labels.noSessions}</span>
           ) : null}
-          {snapshot.sessions?.sessions.map((session) => (
+          {sessions.map((session) => (
             <div
               className="paui-session"
               data-active={
@@ -1931,10 +2207,37 @@ function SessionDrawer({
                 onClick={() => void select(session.sessionId)}
               >
                 <strong>{session.title ?? labels.sessionUntitled}</strong>
-                <span>{formatSessionDate(session.updatedAt)}</span>
+                <span className="paui-session__meta">
+                  {session.loaded
+                    ? labels.sessionPhase(session.loaded.phase)
+                    : formatSessionDate(session.updatedAt)}
+                  {session.loaded?.interactionCount ? (
+                    <span>
+                      {labels.pendingInteractions(
+                        session.loaded.interactionCount,
+                      )}
+                    </span>
+                  ) : null}
+                </span>
               </button>
-              {snapshot.capabilities.deleteSession &&
-              session.sessionId !== snapshot.sessionId ? (
+              {session.loaded && snapshot.capabilities.closeSession ? (
+                <button
+                  className="paui-icon-button"
+                  type="button"
+                  disabled={
+                    loading ||
+                    session.loaded.phase === "running" ||
+                    session.loaded.phase === "cancelling" ||
+                    session.loaded.interactionCount > 0
+                  }
+                  title={labels.closeSession}
+                  onClick={() => void closeSession(session.sessionId)}
+                >
+                  <CloseIcon />
+                  <span className="paui-sr-only">{labels.closeSession}</span>
+                </button>
+              ) : snapshot.capabilities.deleteSession &&
+                session.sessionId !== snapshot.sessionId ? (
                 <button
                   className="paui-icon-button"
                   type="button"
@@ -1987,12 +2290,52 @@ function SessionDrawer({
   );
 }
 
+interface DrawerSession extends SessionInfo {
+  readonly loaded?: ChatSnapshot["loadedSessions"][number];
+}
+
+function mergeDrawerSessions(snapshot: ChatSnapshot): readonly DrawerSession[] {
+  const catalog = new Map(
+    (snapshot.sessions?.sessions ?? []).map((session) => [
+      session.sessionId,
+      session,
+    ]),
+  );
+  const loadedIds = new Set(
+    snapshot.loadedSessions.map((session) => session.sessionId),
+  );
+  return [
+    ...snapshot.loadedSessions.map((session) => ({
+      ...catalog.get(session.sessionId),
+      ...session,
+      loaded: session,
+    })),
+    ...(snapshot.sessions?.sessions ?? []).filter(
+      (session) => !loadedIds.has(session.sessionId),
+    ),
+  ];
+}
+
 function activeElementFor(element: Element | null): Element | null {
   const root = element?.getRootNode();
   if (root instanceof Document || root instanceof ShadowRoot) {
     return root.activeElement;
   }
   return document.activeElement;
+}
+
+function formatRawToolValue(value: unknown): string {
+  const rendered =
+    typeof value === "string"
+      ? value
+      : (() => {
+          try {
+            return JSON.stringify(value, null, 2) ?? String(value);
+          } catch {
+            return String(value);
+          }
+        })();
+  return rendered.slice(0, 100_000);
 }
 
 const markdown = new Marked({ gfm: true, breaks: true });
@@ -2057,6 +2400,13 @@ function controllerKey(controller: ChatController): number {
   const key = ++controllerKeyCounter;
   controllerKeys.set(controller, key);
   return key;
+}
+
+function sessionCacheKey(snapshot: ChatSnapshot): string | undefined {
+  if (!snapshot.sessionId) return undefined;
+  return snapshot.sessionInstanceId
+    ? `${snapshot.sessionId}\u0000${snapshot.sessionInstanceId}`
+    : snapshot.sessionId;
 }
 
 function subscribeOnAnimationFrame(

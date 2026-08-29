@@ -28,7 +28,7 @@ test("streams ACP activity and keeps the package-owned content safe", async ({
   await expect(thought.locator(".paui-flow-preview")).toHaveText(
     "Checking the request against the workspace.",
   );
-  await page.getByText("Think", { exact: true }).click();
+  await page.getByText("Thinking", { exact: true }).click();
   await expect(thought).toHaveAttribute("open", "");
   await expect(page.locator(".paui-thought .paui-markdown")).toHaveText(
     "Checking the request against the workspace.",
@@ -68,6 +68,70 @@ test("uses the host surface and scheme without changing global page layout", asy
   expect(overflow).toBeLessThanOrEqual(0);
 });
 
+test("keeps header actions visible for extreme valid usage", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/?scheme=light&usage=extreme");
+  const composer = page.getByLabel("Ask anything…");
+  await composer.fill("report usage");
+  await composer.press("Enter");
+  await expect(page.locator(".paui-usage")).toHaveText("1.80e+308 / 1.80e+308");
+
+  const geometry = await page
+    .locator('[data-pretty-aui-slot="root"]')
+    .evaluate((root) => {
+      const rootBox = root.getBoundingClientRect();
+      const actions = root.querySelector<HTMLElement>(".paui-header__actions")!;
+      const actionsBox = actions.getBoundingClientRect();
+      return {
+        overflow: root.scrollWidth - root.clientWidth,
+        actionsRight: actionsBox.right,
+        rootRight: rootBox.right,
+      };
+    });
+  expect(geometry.overflow).toBeLessThanOrEqual(0);
+  expect(geometry.actionsRight).toBeLessThanOrEqual(geometry.rootRight);
+  await expect(page.getByRole("button", { name: "New chat" })).toBeInViewport();
+});
+
+test("keeps a short session list compact and anchored to the top", async ({
+  page,
+}) => {
+  await page.goto("/?scheme=light");
+  await expect(page.getByLabel("Ask anything…")).toBeEnabled();
+  await page.evaluate(async () => {
+    const controller = (
+      window as typeof window & {
+        __PRETTY_AUI__?: { newSession(): Promise<void> };
+      }
+    ).__PRETTY_AUI__;
+    if (!controller) throw new Error("Demo controller is unavailable");
+    for (let index = 0; index < 4; index += 1) {
+      await controller.newSession();
+    }
+  });
+
+  await page.getByRole("button", { name: "Sessions" }).click();
+  const list = page.locator(".paui-session-list");
+  const rows = list.locator(".paui-session");
+  await expect(rows).toHaveCount(5);
+  const geometry = await list.evaluate((element) => {
+    const listBox = element.getBoundingClientRect();
+    const rowBoxes = [...element.querySelectorAll(".paui-session")].map((row) =>
+      row.getBoundingClientRect(),
+    );
+    return {
+      firstTop: rowBoxes[0]!.top - listBox.top,
+      lastBottom: rowBoxes.at(-1)!.bottom - listBox.top,
+      maxRowHeight: Math.max(...rowBoxes.map((row) => row.height)),
+    };
+  });
+  expect(geometry.firstTop).toBeLessThanOrEqual(9);
+  expect(geometry.maxRowHeight).toBeLessThanOrEqual(56);
+  expect(geometry.lastBottom).toBeLessThanOrEqual(300);
+});
+
 test("scrolls a long session list over a transparent backdrop", async ({
   page,
 }) => {
@@ -80,7 +144,7 @@ test("scrolls a long session list over a transparent backdrop", async ({
       }
     ).__PRETTY_AUI__;
     if (!controller) throw new Error("Demo controller is unavailable");
-    for (let index = 0; index < 24; index += 1) {
+    for (let index = 0; index < 15; index += 1) {
       await controller.newSession();
     }
   });
@@ -117,7 +181,7 @@ test("scrolls a long session list over a transparent backdrop", async ({
   await expect(backdrop).toHaveCSS("backdrop-filter", "none");
 });
 
-test("reopens a demo session without a pre-injected user message", async ({
+test("reselects a loaded demo session without replaying its history", async ({
   page,
 }) => {
   await page.goto("/?scheme=light");
@@ -130,9 +194,10 @@ test("reopens a demo session without a pre-injected user message", async ({
   await page.getByRole("button", { name: "New chat" }).click();
   await page.getByRole("button", { name: "Sessions" }).click();
   await page.getByRole("button", { name: /Conversation 1/ }).click();
-  await expect(
-    page.getByText("Replayed history", { exact: true }),
-  ).toBeVisible();
+  await expect(page.getByText("Ready", { exact: true })).toBeVisible();
+  await expect(page.getByText("Replayed history", { exact: true })).toHaveCount(
+    0,
+  );
 
   const userMessage = page.locator(
     '[data-pretty-aui-slot="message"][data-role="user"]',

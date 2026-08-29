@@ -204,6 +204,114 @@ describe("Chat composition", () => {
     await waitFor(() => expect(loadMore).not.toBeDisabled());
   });
 
+  it("keeps loaded sessions discoverable with phase, interactions, and close actions", async () => {
+    const controller = new FakeChatController({
+      sessionId: "active",
+      sessionTitle: "Active work",
+      loadedSessions: [
+        {
+          sessionId: "active",
+          title: "Active work",
+          phase: "running",
+          interactionCount: 0,
+        },
+        {
+          sessionId: "background",
+          phase: "awaiting_user",
+          interactionCount: 2,
+        },
+        {
+          sessionId: "closable",
+          title: "Closable work",
+          phase: "idle",
+          interactionCount: 0,
+        },
+      ],
+      sessions: {
+        sessions: [
+          { sessionId: "background", title: "Background review" },
+          { sessionId: "archived", title: "Archived" },
+        ],
+      },
+      capabilities: {
+        listSessions: true,
+        loadSession: true,
+        resumeSession: true,
+        closeSession: true,
+        deleteSession: true,
+      },
+    });
+    render(<Chat controller={controller} />);
+    fireEvent.click(screen.getByRole("button", { name: "Sessions" }));
+    const background = screen
+      .getByText("Background review")
+      .closest(".paui-session")!;
+
+    expect(background).toHaveTextContent("Awaiting User");
+    expect(background).toHaveTextContent("2 pending interactions");
+    expect(
+      within(background as HTMLElement).getByRole("button", {
+        name: "Close session",
+      }),
+    ).toBeDisabled();
+    fireEvent.click(
+      within(background as HTMLElement).getByRole("button", {
+        name: /Background review/,
+      }),
+    );
+    expect(controller.openedSessions).toEqual(["background"]);
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Sessions" }));
+    const reopened = screen
+      .getByText("Closable work")
+      .closest(".paui-session")!;
+    fireEvent.click(
+      within(reopened as HTMLElement).getByRole("button", {
+        name: "Close session",
+      }),
+    );
+    await waitFor(() =>
+      expect(controller.closedSessions).toEqual(["closable"]),
+    );
+  });
+
+  it("allows a new session while the selected session is running", () => {
+    const controller = new FakeChatController({
+      phase: "running",
+      loadedSessions: [
+        {
+          sessionId: "session-1",
+          phase: "running",
+          interactionCount: 0,
+        },
+      ],
+    });
+    render(<Chat controller={controller} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "New chat" }));
+
+    expect(controller.newSessionCalls).toBe(1);
+  });
+
+  it("shows bounded session usage in the header", () => {
+    const controller = new FakeChatController({
+      usage: { used: 1_024, size: 8_192 },
+    });
+    render(<Chat controller={controller} />);
+
+    expect(screen.getByText("1,024 / 8,192")).toBeInTheDocument();
+
+    act(() => {
+      controller.setSnapshot({
+        usage: { used: Number.MAX_VALUE, size: Number.MAX_VALUE },
+      });
+    });
+    expect(screen.getByText("1.80e+308 / 1.80e+308")).toBeInTheDocument();
+  });
+
   it("keeps construction options immutable and destroys only its owned controller", async () => {
     const first = createV1Harness();
     const replacement = createV1Harness();
@@ -289,6 +397,42 @@ describe("Chat composition", () => {
       container.querySelector('[data-pretty-aui-slot="composer-input"]'),
     ).toBeInTheDocument();
     expect(screen.getByLabelText("Describe the change")).toBeInTheDocument();
+  });
+
+  it("renders the ordered next-turn context selection above the prompt", () => {
+    const controller = new FakeChatController({
+      contextSelection: {
+        items: [
+          { id: "page", label: "Current page" },
+          { id: "task", label: "Current task" },
+        ],
+        canAdd: true,
+        canRemove: true,
+        busy: false,
+      },
+    });
+    const { container } = render(<Chat controller={controller} />);
+    const selection = container.querySelector(
+      '[data-pretty-aui-slot="composer-context"]',
+    );
+    const input = screen.getByLabelText("Ask anything…");
+
+    expect(selection).toBeInTheDocument();
+    expect(
+      selection!.compareDocumentPosition(input) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      container.querySelectorAll(
+        '[data-pretty-aui-slot="composer-context-item"]',
+      ),
+    ).toHaveLength(2);
+    fireEvent.click(screen.getByRole("button", { name: "Add context" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Remove context: Current page" }),
+    );
+    expect(controller.addContextCalls).toBe(1);
+    expect(controller.removedContextIds).toEqual(["page"]);
   });
 
   it("shows the current session title and follows later title updates", () => {
@@ -463,6 +607,139 @@ describe("Transcript", () => {
     expect(details.open).toBe(true);
   });
 
+  it("shows submitted context as a collapsed inert disclosure", () => {
+    const controller = new FakeChatController({
+      activities: [
+        message("user", "Inspect this evaluation"),
+        {
+          type: "context",
+          id: "context-turn-1-page",
+          contextId: "page",
+          label: "Current page",
+          content: [
+            {
+              type: "text",
+              text: "<system-reminder>literal</system-reminder>",
+            },
+            {
+              type: "resource",
+              resource: {
+                uri: "peval://source/cell-1",
+                mimeType: "application/json",
+                text: '{"score":0}',
+              },
+            },
+          ],
+        },
+        message("assistant", "Reviewed"),
+      ],
+    });
+    const { container } = render(<Chat controller={controller} />);
+    const row = container.querySelector<HTMLElement>(
+      '[data-pretty-aui-slot="activity"][data-kind="context"]',
+    )!;
+    const details = row.querySelector<HTMLDetailsElement>("details")!;
+
+    expect(details.open).toBe(false);
+    expect(within(row).getByText("Context injection")).toBeInTheDocument();
+    expect(within(row).getByText("Current page")).toBeInTheDocument();
+    fireEvent.click(details.querySelector("summary")!);
+    expect(details.open).toBe(true);
+    expect(within(row).getByText(/<system-reminder>/)).toBeInTheDocument();
+    expect(row.querySelector("system-reminder")).toBeNull();
+    expect(within(row).getByText("peval://source/cell-1")).toBeInTheDocument();
+    expect(within(row).getByText("application/json")).toBeInTheDocument();
+    expect(within(row).getByText('{"score":0}')).toBeInTheDocument();
+    expect(row.querySelector("a, img, audio")).toBeNull();
+  });
+
+  it("bounds context disclosure text without changing the activity", () => {
+    const text = "x".repeat(20_001);
+    const activity: ChatActivity = {
+      type: "context",
+      id: "context-turn-1-large",
+      contextId: "large",
+      label: "Large context",
+      content: [{ type: "text", text }],
+    };
+    const { container } = render(
+      <Chat controller={new FakeChatController({ activities: [activity] })} />,
+    );
+
+    const literal = container.querySelector<HTMLElement>(".paui-context-text")!;
+    expect(literal.textContent).toHaveLength(20_000);
+    expect(
+      screen.getByText("Context display truncated (20,001 characters total)."),
+    ).toBeInTheDocument();
+    expect(activity.content).toEqual([{ type: "text", text }]);
+  });
+
+  it("renders context links, media, blobs, and unknown blocks as inert text", () => {
+    const controller = new FakeChatController({
+      activities: [
+        {
+          type: "context",
+          id: "context-turn-1-inert",
+          contextId: "inert",
+          label: "Inert blocks",
+          content: [
+            {
+              type: "resource_link",
+              name: "Evidence link",
+              uri: "https://example.com/evidence",
+              mimeType: "text/plain",
+              description: "Captured upstream",
+            },
+            {
+              type: "resource",
+              resource: {
+                uri: "peval://binary",
+                blob: "YWJj",
+              },
+            },
+            { type: "image", mimeType: "image/png", data: "aGVsbG8=" },
+            { type: "audio", mimeType: "audio/ogg", data: "aGVsbG8=" },
+            { type: "future_context", payload: { literal: "<b>raw</b>" } },
+          ],
+        },
+      ],
+    });
+    const { container } = render(<Chat controller={controller} />);
+    const row = container.querySelector<HTMLElement>('[data-kind="context"]')!;
+
+    expect(within(row).getByText("Evidence link")).toBeInTheDocument();
+    expect(
+      within(row).getByText("https://example.com/evidence"),
+    ).toBeInTheDocument();
+    expect(within(row).getByText(/4 base64 characters/)).toBeInTheDocument();
+    expect(within(row).getByText(/image\/png/)).toBeInTheDocument();
+    expect(within(row).getByText(/audio\/ogg/)).toBeInTheDocument();
+    expect(within(row).getByText(/<b>raw<\/b>/)).toBeInTheDocument();
+    expect(row.querySelector("a, img, audio, video, source")).toBeNull();
+  });
+
+  it("uses the Thinking label for thought activity", () => {
+    render(
+      <Chat
+        controller={
+          new FakeChatController({
+            activities: [
+              {
+                type: "message",
+                id: "thought-label",
+                role: "thought",
+                content: [{ type: "text", text: "Inspecting" }],
+              },
+            ],
+          })
+        }
+      />,
+    );
+
+    expect(screen.getByText("Thinking", { exact: true })).toBeInTheDocument();
+    expect(screen.queryByText("Think", { exact: true })).toBeNull();
+  });
+
   it("follows only while pinned and offers a return-to-bottom control", () => {
     const controller = new FakeChatController({
       activities: [message("assistant", "one")],
@@ -482,6 +759,7 @@ describe("Transcript", () => {
     const latest = screen.getByRole("button", {
       name: "Scroll to latest message",
     });
+    expect(scroller).not.toContainElement(latest);
     fireEvent.click(latest);
     expect(scroller.scrollTop).toBe(1_000);
 
@@ -490,6 +768,70 @@ describe("Transcript", () => {
     expect(
       screen.queryByRole("button", { name: "Scroll to latest message" }),
     ).not.toBeInTheDocument();
+  });
+
+  it("restores transcript scroll state per loaded session", () => {
+    const controller = new FakeChatController({
+      sessionId: "session-1",
+      activities: [message("assistant", "one")],
+    });
+    const { container } = render(<Chat controller={controller} />);
+    const scroller = container.querySelector<HTMLElement>(
+      '[data-pretty-aui-slot="transcript"]',
+    )!;
+    Object.defineProperties(scroller, {
+      scrollHeight: { configurable: true, value: 1_000 },
+      clientHeight: { configurable: true, value: 400 },
+    });
+    scroller.scrollTop = 600;
+    fireEvent.scroll(scroller);
+    scroller.scrollTop = 100;
+    fireEvent.scroll(scroller);
+
+    act(() => {
+      controller.setSnapshot({
+        sessionId: "session-2",
+        activities: [message("assistant", "two")],
+      });
+    });
+    scroller.scrollTop = 300;
+    fireEvent.scroll(scroller);
+    act(() => {
+      controller.setSnapshot({
+        sessionId: "session-1",
+        activities: [message("assistant", "one")],
+      });
+    });
+
+    expect(scroller.scrollTop).toBe(100);
+  });
+
+  it("does not restore scroll state into a new incarnation of the same session ID", () => {
+    const controller = new FakeChatController({
+      sessionId: "reused-session",
+      sessionInstanceId: "instance-1",
+      activities: [message("assistant", "one")],
+    });
+    const { container } = render(<Chat controller={controller} />);
+    const scroller = container.querySelector<HTMLElement>(
+      '[data-pretty-aui-slot="transcript"]',
+    )!;
+    Object.defineProperties(scroller, {
+      scrollHeight: { configurable: true, value: 1_000 },
+      clientHeight: { configurable: true, value: 400 },
+    });
+    scroller.scrollTop = 100;
+    fireEvent.scroll(scroller);
+
+    act(() => {
+      controller.setSnapshot({
+        sessionId: "reused-session",
+        sessionInstanceId: "instance-2",
+        activities: [],
+      });
+    });
+
+    expect(scroller.scrollTop).toBe(1_000);
   });
 });
 
@@ -524,6 +866,31 @@ describe("Tool rendering seam", () => {
     expect(details.open).toBe(false);
     fireEvent.click(details.querySelector("summary")!);
     expect(details.open).toBe(true);
+  });
+
+  it("falls back to bounded raw tool input and output", () => {
+    const controller = new FakeChatController({
+      activities: [
+        {
+          type: "tool",
+          id: "raw-tool",
+          title: "Custom tool",
+          kind: "custom",
+          status: "completed",
+          content: [],
+          locations: [],
+          rawInput: { query: "needle" },
+          rawOutput: { matches: 3 },
+        },
+      ],
+    });
+    render(<Chat controller={controller} />);
+
+    fireEvent.click(screen.getByText("Custom tool"));
+    expect(screen.getByText("Input")).toBeInTheDocument();
+    expect(screen.getByText(/"query": "needle"/)).toBeInTheDocument();
+    expect(screen.getByText("Output")).toBeInTheDocument();
+    expect(screen.getByText(/"matches": 3/)).toBeInTheDocument();
   });
 
   it("uses the built-in body when a custom renderer returns undefined", () => {
@@ -1045,7 +1412,7 @@ describe("Composer", () => {
     );
   });
 
-  it("clears drafts on session change while keeping one composer DOM node", () => {
+  it("restores drafts per session while keeping one composer DOM node", () => {
     const controller = new FakeChatController();
     const { container } = render(<Chat controller={controller} />);
     const composer = screen.getByLabelText("Ask anything…");
@@ -1066,6 +1433,41 @@ describe("Composer", () => {
       region,
     );
     expect(region).toHaveAttribute("data-placement", "docked");
+
+    fireEvent.input(composer, { target: { value: "second draft" } });
+    act(() => {
+      controller.setSnapshot({
+        sessionId: "session-1",
+        activities: [],
+      });
+    });
+    expect(composer).toHaveValue("session draft");
+    act(() => {
+      controller.setSnapshot({
+        sessionId: "session-2",
+        activities: [message("assistant", "new session activity")],
+      });
+    });
+    expect(composer).toHaveValue("second draft");
+  });
+
+  it("does not restore a draft into a new incarnation of the same session ID", () => {
+    const controller = new FakeChatController({
+      sessionId: "reused-session",
+      sessionInstanceId: "instance-1",
+    });
+    render(<Chat controller={controller} />);
+    const composer = screen.getByLabelText("Ask anything…");
+    fireEvent.input(composer, { target: { value: "old incarnation draft" } });
+
+    act(() => {
+      controller.setSnapshot({
+        sessionId: "reused-session",
+        sessionInstanceId: "instance-2",
+      });
+    });
+
+    expect(composer).toHaveValue("");
   });
 
   it("applies commands and configuration through controller methods", () => {

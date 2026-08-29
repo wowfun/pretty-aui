@@ -10,15 +10,21 @@ import type {
 
 const EMPTY_SNAPSHOT: ChatSnapshot = {
   phase: "idle",
+  loadedSessions: [],
   protocolVersion: 1,
   agentName: "Fixture Agent",
   sessionId: "session-1",
   sessionTrail: [],
   historyGap: false,
   activities: [],
-  contextItems: [],
   configOptions: [],
   commands: [],
+  contextSelection: {
+    items: [],
+    canAdd: false,
+    canRemove: false,
+    busy: false,
+  },
   interactions: [],
   authMethods: [],
   capabilities: {
@@ -45,8 +51,13 @@ export class FakeChatController implements ChatController {
   unsubscribeCalls = 0;
   destroyCalls = 0;
   cancelCalls = 0;
+  addContextCalls = 0;
+  readonly removedContextIds: string[] = [];
   reconnectCalls = 0;
   newSessionCalls = 0;
+  readonly openedSessions: string[] = [];
+  readonly closedSessions: (string | undefined)[] = [];
+  readonly deletedSessions: string[] = [];
   readonly openedChildSessions: string[] = [];
   readonly openedAncestorSessions: string[] = [];
   readonly listSessionsCalls: (string | undefined)[] = [];
@@ -105,6 +116,14 @@ export class FakeChatController implements ChatController {
     if (this.cancelError) throw this.cancelError;
   }
 
+  async addContext(): Promise<void> {
+    this.addContextCalls += 1;
+  }
+
+  async removeContext(id: string): Promise<void> {
+    this.removedContextIds.push(id);
+  }
+
   async reconnect(): Promise<void> {
     this.reconnectCalls += 1;
   }
@@ -118,7 +137,9 @@ export class FakeChatController implements ChatController {
     return this.listSessionsResult;
   }
 
-  async openSession(): Promise<void> {}
+  async openSession(sessionId: string): Promise<void> {
+    this.openedSessions.push(sessionId);
+  }
 
   async openChildSession(sessionId: string): Promise<void> {
     if (this.openChildSessionError) throw this.openChildSessionError;
@@ -130,9 +151,13 @@ export class FakeChatController implements ChatController {
     this.openedAncestorSessions.push(sessionId);
   }
 
-  async closeSession(): Promise<void> {}
+  async closeSession(sessionId?: string): Promise<void> {
+    this.closedSessions.push(sessionId);
+  }
 
-  async deleteSession(): Promise<void> {}
+  async deleteSession(sessionId: string): Promise<void> {
+    this.deletedSessions.push(sessionId);
+  }
 
   async setConfigOption(id: string, value: string | boolean): Promise<void> {
     this.configChanges.push({ id, value });

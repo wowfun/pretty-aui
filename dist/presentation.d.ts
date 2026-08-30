@@ -19,9 +19,10 @@ export interface ChatLabels {
     readonly cancel: string;
     readonly changedFiles: string;
     readonly close: string;
-    readonly closeSession: string;
     readonly commands: string;
     readonly composerPlaceholder: string;
+    readonly copied: string;
+    readonly copy: string;
     readonly contextInjection: string;
     readonly contextSelection: string;
     readonly contextTruncated: (total: number) => string;
@@ -46,6 +47,8 @@ export interface ChatLabels {
     readonly resource: string;
     readonly scrollToLatest: string;
     readonly send: string;
+    readonly sessionAge: (value: number, unit: "now" | "minute" | "hour" | "day" | "month" | "year") => string;
+    readonly sessionActions: (title: string) => string;
     readonly sessionPhase: (phase: string) => string;
     readonly sessionUntitled: string;
     readonly sessions: string;
@@ -53,7 +56,10 @@ export interface ChatLabels {
     readonly thinking: string;
     readonly terminalOutputInActivity: string;
     readonly tool: string;
+    readonly toolCollapseLines: string;
+    readonly toolExpandLines: (hidden: number) => string;
     readonly toolInput: string;
+    readonly toolNoOutput: string;
     readonly toolOutput: string;
     readonly toolResult: string;
     readonly unsupportedContent: (type: string) => string;

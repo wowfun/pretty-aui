@@ -15,9 +15,10 @@ export const defaultLabels = {
     cancel: "Cancel",
     changedFiles: "Changed files",
     close: "Close",
-    closeSession: "Close session",
     commands: "Commands",
     composerPlaceholder: "Ask anything…",
+    copied: "Copied",
+    copy: "Copy",
     contextInjection: "Context injection",
     contextSelection: "Context for next prompt",
     contextTruncated: (total) => `Context display truncated (${total.toLocaleString()} characters total).`,
@@ -42,6 +43,19 @@ export const defaultLabels = {
     resource: "Resource",
     scrollToLatest: "Scroll to latest message",
     send: "Send",
+    sessionAge: (value, unit) => {
+        if (unit === "now")
+            return "now";
+        const suffix = {
+            minute: "m",
+            hour: "h",
+            day: "d",
+            month: "mo",
+            year: "y",
+        }[unit];
+        return `${value}${suffix}`;
+    },
+    sessionActions: (title) => `Actions for ${title}`,
     sessionPhase: (phase) => titleCase(phase),
     sessionUntitled: "Untitled session",
     sessions: "Sessions",
@@ -49,7 +63,10 @@ export const defaultLabels = {
     thinking: "Thinking",
     terminalOutputInActivity: "Terminal output is shown in the activity stream.",
     tool: "Tool",
+    toolCollapseLines: "Show less",
+    toolExpandLines: (hidden) => `... more ${hidden.toLocaleString()} ${hidden === 1 ? "line" : "lines"}`,
     toolInput: "Input",
+    toolNoOutput: "No output",
     toolOutput: "Output",
     toolResult: "tool result",
     unsupportedContent: (type) => `Unsupported agent content: ${type}`,

@@ -1,4 +1,6 @@
+import { restoreUserPrompt } from "../prompt-envelope.js";
 const MAX_ACTIVITIES = 1_000;
+const MAX_NOTICES = 64;
 const MAX_COLLECTION_ITEMS = 256;
 const MAX_METADATA_TEXT = 16 * 1024;
 const MAX_CONTENT_BLOCKS = 256;
@@ -193,7 +195,10 @@ export class TimelineStore {
     #counter = 0;
     #lastAnonymousMessage = new Map();
     #pendingUserId;
-    #pendingContextIds = new Set();
+    #turnUserTimestamp;
+    #restoredUserMessageIds = new Set();
+    #reportedMalformedUserMessageIds = new Set();
+    #pendingReplayUserId;
     #terminalState = new Map();
     get activities() {
         return this.#activities;
@@ -202,25 +207,106 @@ export class TimelineStore {
         this.#activities = [];
         this.#lastAnonymousMessage.clear();
         this.#pendingUserId = undefined;
-        this.#pendingContextIds.clear();
+        this.#turnUserTimestamp = undefined;
+        this.#restoredUserMessageIds.clear();
+        this.#reportedMalformedUserMessageIds.clear();
+        this.#pendingReplayUserId = undefined;
         this.#terminalState.clear();
     }
     beginTurn() {
         this.#lastAnonymousMessage.clear();
-        this.#pendingContextIds.clear();
+        this.#turnUserTimestamp = undefined;
     }
-    addUserMessage(content, pending) {
+    addNotice(activity) {
+        let removeCount = this.#activities.filter((candidate) => candidate.type === "notice")
+            .length -
+            MAX_NOTICES +
+            1;
+        if (removeCount > 0) {
+            this.#activities = this.#activities.filter((candidate) => {
+                if (candidate.type !== "notice" || removeCount <= 0)
+                    return true;
+                removeCount -= 1;
+                return false;
+            });
+        }
+        this.#appendActivity(activity);
+    }
+    addUserMessage(content, pending, timestamp) {
+        const reliableTimestamp = normalizeLocalEventTimestamp(timestamp);
+        const normalized = normalizeContent(content);
         const id = `local-user-${++this.#counter}`;
         this.#appendActivity({
             type: "message",
             id,
             role: "user",
-            content: normalizeContent(content),
+            content: normalized,
+            ...(reliableTimestamp !== undefined
+                ? { timestamp: reliableTimestamp }
+                : {}),
             ...(pending ? { pending: true } : {}),
         });
-        if (pending)
+        this.#turnUserTimestamp = reliableTimestamp;
+        if (pending) {
             this.#pendingUserId = id;
+        }
+        else {
+            this.#pendingUserId = undefined;
+        }
         return id;
+    }
+    markFinalAnswer(timestamp) {
+        const reliableTimestamp = normalizeLocalEventTimestamp(timestamp);
+        if (reliableTimestamp === undefined)
+            return;
+        for (let index = this.#activities.length - 1; index >= 0; index -= 1) {
+            const activity = this.#activities[index];
+            if (activity?.type !== "message")
+                continue;
+            if (activity.role === "user")
+                return;
+            if (activity.role !== "assistant")
+                continue;
+            this.#replace(activity.id, () => ({
+                ...activity,
+                timestamp: Math.max(reliableTimestamp, this.#turnUserTimestamp ?? reliableTimestamp),
+            }));
+            return;
+        }
+    }
+    finishTurn(finalAnswerTimestamp) {
+        if (finalAnswerTimestamp !== undefined) {
+            this.markFinalAnswer(finalAnswerTimestamp);
+        }
+        if (this.#pendingUserId) {
+            this.#replace(this.#pendingUserId, (activity) => {
+                if (activity.type !== "message")
+                    return activity;
+                const { pending: _pending, ...settled } = activity;
+                return settled;
+            });
+        }
+        this.#pendingUserId = undefined;
+    }
+    finalizeReplay() {
+        this.#flushReplayUser();
+        const diagnostics = [];
+        for (const activity of this.#activities) {
+            if (activity.type !== "message" ||
+                activity.role !== "user" ||
+                this.#reportedMalformedUserMessageIds.has(activity.id)) {
+                continue;
+            }
+            const restored = restoreUserPrompt(activity.content);
+            if (restored.status !== "malformed")
+                continue;
+            this.#reportedMalformedUserMessageIds.add(activity.id);
+            diagnostics.push({
+                code: "MALFORMED_USER_MESSAGE_ENVELOPE",
+                message: "A restored user-message envelope was incomplete; retained the Agent history unchanged",
+            });
+        }
+        return diagnostics.length ? { diagnostics } : {};
     }
     markUserAccepted(contextItems = []) {
         if (!this.#pendingUserId)
@@ -236,13 +322,16 @@ export class TimelineStore {
             };
             this.#appendActivity(activity);
         }
-        this.#pendingContextIds = new Set(contextItems.map((item) => item.id));
     }
     reduce(update, protocol) {
         if (!isRecord(update) || typeof update.sessionUpdate !== "string") {
             return { unsupported: "invalid_update" };
         }
         const kind = asString(update.sessionUpdate) ?? "";
+        if (this.#pendingUserId &&
+            (kind === "user_message_chunk" || kind === "user_message")) {
+            return {};
+        }
         switch (kind) {
             case "user_message_chunk":
             case "agent_message_chunk":
@@ -319,11 +408,6 @@ export class TimelineStore {
         }
     }
     #appendMessage(role, messageId, content, protocol) {
-        if (role === "user" &&
-            this.#pendingUserId &&
-            isSubmittedContextBlock(content, this.#pendingContextIds)) {
-            return;
-        }
         let wireId = messageId;
         if (!wireId && protocol === 1) {
             wireId =
@@ -333,15 +417,12 @@ export class TimelineStore {
         if (!wireId)
             return;
         const id = messageActivityId(role, wireId);
-        if (role === "user" && this.#pendingUserId) {
-            const pendingId = this.#pendingUserId;
-            const existing = this.#activities.find((item) => item.type === "message" && item.id === pendingId);
-            if (existing?.type === "message") {
-                this.#replace(pendingId, () => ({ ...existing, id, pending: false }));
-                this.#pendingUserId = undefined;
-                this.#pendingContextIds.clear();
-            }
+        if (this.#pendingReplayUserId &&
+            (role !== "user" || this.#pendingReplayUserId !== id)) {
+            this.#flushReplayUser();
         }
+        if (role === "user" && this.#restoredUserMessageIds.has(id))
+            return;
         const existing = this.#activities.find((item) => item.type === "message" && item.id === id);
         const block = normalizeContentBlock(content);
         if (!block)
@@ -353,42 +434,46 @@ export class TimelineStore {
             }));
         }
         else {
-            this.#appendActivity({ type: "message", id, role, content: [block] });
+            this.#appendActivity({
+                type: "message",
+                id,
+                role,
+                content: [block],
+            });
         }
+        if (role === "user")
+            this.#pendingReplayUserId = id;
     }
     #upsertMessage(role, messageId, update) {
         if (!messageId)
             return;
+        this.#flushReplayUser();
         const id = messageActivityId(role, messageId);
-        if (role === "user" && this.#pendingUserId) {
-            const pendingId = this.#pendingUserId;
-            const pending = this.#activities.find((item) => item.type === "message" && item.id === pendingId);
-            if (pending?.type === "message") {
-                const content = Object.hasOwn(update, "content")
-                    ? normalizeUserEcho(update.content, this.#pendingContextIds)
-                    : pending.content;
-                this.#replace(pendingId, () => ({
-                    ...pending,
-                    id,
-                    content,
-                    pending: false,
-                }));
-                this.#pendingUserId = undefined;
-                this.#pendingContextIds.clear();
-                return;
-            }
-        }
         const existing = this.#activities.find((item) => item.type === "message" && item.id === id);
-        const content = Object.hasOwn(update, "content")
+        const normalizedContent = Object.hasOwn(update, "content")
             ? normalizeContent(update.content)
             : existing?.type === "message"
                 ? existing.content
                 : [];
+        const restored = role === "user" ? restoreUserPrompt(normalizedContent) : undefined;
+        const content = restored?.status === "restored" ? restored.content : normalizedContent;
         if (existing?.type === "message") {
-            this.#replace(id, () => ({ ...existing, role, content }));
+            this.#replace(id, () => ({
+                ...existing,
+                role,
+                content,
+            }));
         }
         else {
-            this.#appendActivity({ type: "message", id, role, content });
+            this.#appendActivity({
+                type: "message",
+                id,
+                role,
+                content,
+            });
+        }
+        if (restored?.status === "restored") {
+            this.#restoreReplayUser(id, restored);
         }
     }
     #upsertTool(update) {
@@ -567,34 +652,82 @@ export class TimelineStore {
     #remove(id) {
         this.#activities = this.#activities.filter((activity) => activity.id !== id);
     }
+    #flushReplayUser() {
+        const id = this.#pendingReplayUserId;
+        this.#pendingReplayUserId = undefined;
+        if (!id || this.#restoredUserMessageIds.has(id))
+            return;
+        const activity = this.#activities.find((item) => item.id === id);
+        if (activity?.type !== "message" || activity.role !== "user")
+            return;
+        const restored = restoreUserPrompt(activity.content);
+        if (restored.status !== "restored")
+            return;
+        this.#restoreReplayUser(id, restored);
+    }
+    #restoreReplayUser(id, restored) {
+        if (this.#restoredUserMessageIds.has(id))
+            return;
+        this.#restoredUserMessageIds.add(id);
+        this.#replace(id, (activity) => activity.type === "message"
+            ? { ...activity, content: restored.content }
+            : activity);
+        this.#insertActivitiesAfter(id, restored.context.map((item) => ({
+            type: "context",
+            id: `restored-context-${++this.#counter}`,
+            contextId: item.id,
+            label: item.label,
+            content: item.content,
+        })));
+    }
+    #insertActivitiesAfter(id, activities) {
+        if (!activities.length)
+            return;
+        const index = this.#activities.findIndex((activity) => activity.id === id);
+        if (index < 0)
+            return;
+        this.#activities = [
+            ...this.#activities.slice(0, index + 1),
+            ...activities,
+            ...this.#activities.slice(index + 1),
+        ];
+        this.#trimActivities();
+    }
     #appendActivity(activity) {
         this.#activities = [...this.#activities, activity];
-        if (this.#activities.length <= MAX_ACTIVITIES)
+        this.#trimActivities();
+    }
+    #trimActivities() {
+        let removeCount = this.#activities.filter((activity) => activity.type !== "notice").length -
+            MAX_ACTIVITIES;
+        if (removeCount <= 0)
             return;
-        const removed = this.#activities.slice(0, this.#activities.length - MAX_ACTIVITIES);
-        this.#activities = this.#activities.slice(-MAX_ACTIVITIES);
+        const removed = [];
+        this.#activities = this.#activities.filter((activity) => {
+            if (activity.type === "notice" ||
+                activity.id === this.#pendingUserId ||
+                removeCount <= 0)
+                return true;
+            removeCount -= 1;
+            removed.push(activity);
+            return false;
+        });
         for (const candidate of removed) {
-            if (candidate.id === this.#pendingUserId)
-                this.#pendingUserId = undefined;
+            // Release state owned by evicted terminal activities.
             if (candidate.type === "terminal") {
                 this.#terminalState.delete(candidate.id.slice("terminal:".length));
             }
         }
     }
 }
-function normalizeUserEcho(value, contextIds) {
-    if (!Array.isArray(value))
-        return [];
-    return normalizeContent(value.filter((block) => !isSubmittedContextBlock(block, contextIds)));
-}
-function isSubmittedContextBlock(value, contextIds) {
-    if (!isRecord(value) || !isRecord(value._meta))
-        return false;
-    const marker = value._meta["pretty-aui/context"];
-    return (isRecord(marker) &&
-        marker.version === 1 &&
-        typeof marker.id === "string" &&
-        contextIds.has(marker.id));
+function normalizeLocalEventTimestamp(timestamp) {
+    if (timestamp === undefined ||
+        !Number.isFinite(timestamp) ||
+        timestamp < 0 ||
+        Number.isNaN(new Date(timestamp).valueOf())) {
+        return undefined;
+    }
+    return timestamp;
 }
 function messageActivityId(role, wireId) {
     return `message:${role}:${wireId}`;
@@ -668,7 +801,8 @@ function normalizeContentBlock(value) {
     const type = asString(value.type, 128);
     if (!type)
         return undefined;
-    const base = { type };
+    const contextMetadata = normalizeContextMetadata(value._meta);
+    const base = { type, ...contextMetadata };
     if (type === "text") {
         const text = asString(value.text, MAX_CONTENT_TEXT);
         return text === undefined ? undefined : { ...base, type: "text", text };
@@ -681,7 +815,9 @@ function normalizeContentBlock(value) {
         return { ...base, type, data, mimeType };
     }
     if (type === "resource_link") {
-        const uri = normalizeResourceUri(value.uri);
+        const uri = contextMetadata
+            ? asString(value.uri, MAX_METADATA_TEXT)
+            : normalizeResourceUri(value.uri);
         const name = asString(value.name, MAX_METADATA_TEXT);
         if (!uri || !name)
             return undefined;
@@ -703,7 +839,9 @@ function normalizeContentBlock(value) {
         };
     }
     if (type === "resource" && isRecord(value.resource)) {
-        const uri = normalizeResourceUri(value.resource.uri);
+        const uri = contextMetadata
+            ? asString(value.resource.uri, MAX_METADATA_TEXT)
+            : normalizeResourceUri(value.resource.uri);
         if (!uri)
             return undefined;
         return {
@@ -724,6 +862,30 @@ function normalizeContentBlock(value) {
         };
     }
     return base;
+}
+function normalizeContextMetadata(value) {
+    if (!isRecord(value))
+        return undefined;
+    const context = value["pretty-aui/context"];
+    if (!isRecord(context) ||
+        context.version !== 1 ||
+        typeof context.id !== "string" ||
+        !context.id.trim() ||
+        context.id.length > MAX_METADATA_TEXT ||
+        typeof context.label !== "string" ||
+        !context.label.trim() ||
+        context.label.length > MAX_METADATA_TEXT) {
+        return undefined;
+    }
+    return {
+        _meta: {
+            "pretty-aui/context": {
+                version: 1,
+                id: context.id,
+                label: context.label,
+            },
+        },
+    };
 }
 function boundedArray(value) {
     if (!Array.isArray(value))

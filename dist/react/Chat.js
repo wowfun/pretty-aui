@@ -4,6 +4,9 @@ import { Marked, Renderer } from "marked";
 import { Component, createContext, memo, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, } from "react";
 import { createChat } from "../core/chat-controller.js";
 import { defaultLabels } from "./types.js";
+import { MessageActions } from "./MessageActions.js";
+import { BuiltInToolBody } from "./ToolBlocks.js";
+import { formatToolValue } from "./tool-block-model.js";
 const ChatContext = createContext(undefined);
 const controllerKeys = new WeakMap();
 let controllerKeyCounter = 0;
@@ -35,6 +38,7 @@ const CONNECTING_CONTROLLER = {
     ready: new Promise(() => undefined),
     getSnapshot: () => CONNECTING_SNAPSHOT,
     subscribe: () => () => undefined,
+    appendNotice: () => false,
     send() {
         throw new Error("The chat session is still connecting");
     },
@@ -237,10 +241,12 @@ export function ChatTranscript() {
         return () => observer.disconnect();
     }, [scrollToBottom]);
     const groups = useMemo(() => groupActivities(snapshot.activities), [snapshot.activities]);
-    return (_jsxs(_Fragment, { children: [_jsx("main", { ref: scrollerRef, className: "paui-body", "data-pretty-aui-slot": "transcript", tabIndex: 0, onScroll: updatePinned, children: _jsxs("div", { className: "paui-transcript", ref: contentRef, children: [snapshot.historyGap ? (_jsxs("aside", { className: "paui-notice", role: "status", children: [_jsx(InfoIcon, {}), _jsxs("div", { children: [_jsx("strong", { children: labels.historyGapTitle }), _jsx("span", { children: labels.historyGap })] })] })) : null, !snapshot.activities.length ? (_jsxs("div", { className: "paui-empty", children: [_jsx(SparkIcon, {}), _jsx("strong", { children: labels.emptyTitle }), _jsx("p", { children: labels.emptyDescription })] })) : null, groups.map((group, index) => (_jsx(TurnGroup, { group: group, labels: labels, toolActivityRenderer: toolActivityRenderer, active: index === groups.length - 1 &&
-                                (snapshot.phase === "running" ||
-                                    snapshot.phase === "awaiting_user" ||
-                                    snapshot.phase === "cancelling") }, group.id)))] }) }), !pinned ? (_jsx("div", { className: "paui-to-bottom-row", children: _jsx("button", { className: "paui-to-bottom", type: "button", onClick: () => scrollToBottom("smooth"), "aria-label": labels.scrollToLatest, children: _jsx(DownIcon, {}) }) })) : null] }));
+    const turnActive = snapshot.phase === "running" ||
+        snapshot.phase === "awaiting_user" ||
+        snapshot.phase === "cancelling";
+    const activeGroupIndex = turnActive ? lastTurnGroupIndex(groups) : -1;
+    const completedAnswerIds = useMemo(() => settledAssistantMessageIds(snapshot.activities, turnActive), [snapshot.activities, turnActive]);
+    return (_jsxs(_Fragment, { children: [_jsx("main", { ref: scrollerRef, className: "paui-body", "data-pretty-aui-slot": "transcript", tabIndex: 0, onScroll: updatePinned, children: _jsxs("div", { className: "paui-transcript", ref: contentRef, children: [snapshot.historyGap ? (_jsxs("aside", { className: "paui-notice", role: "status", children: [_jsx(InfoIcon, {}), _jsxs("div", { children: [_jsx("strong", { children: labels.historyGapTitle }), _jsx("span", { children: labels.historyGap })] })] })) : null, !snapshot.activities.length ? (_jsxs("div", { className: "paui-empty", children: [_jsx(SparkIcon, {}), _jsx("strong", { children: labels.emptyTitle }), _jsx("p", { children: labels.emptyDescription })] })) : null, groups.map((group, index) => group.kind === "notice" ? (_jsx(NoticeGroup, { group: group, labels: labels }, group.id)) : (_jsx(TurnGroup, { group: group, labels: labels, toolActivityRenderer: toolActivityRenderer, active: index === activeGroupIndex, completedAnswerIds: completedAnswerIds }, group.id)))] }) }), !pinned ? (_jsx("div", { className: "paui-to-bottom-row", children: _jsx("button", { className: "paui-to-bottom", type: "button", onClick: () => scrollToBottom("smooth"), "aria-label": labels.scrollToLatest, children: _jsx(DownIcon, {}) }) })) : null] }));
 }
 /** Renders authentication, ACP interactions, and reconnectable errors. */
 export function ChatInteractions() {
@@ -262,50 +268,74 @@ export function ChatInteractions() {
     }, [interactionIdentity, snapshot.interactions.length]);
     return (_jsxs("div", { ref: interactionsRef, className: "paui-interactions", "data-pretty-aui-slot": "interactions", children: [snapshot.phase === "auth_required" ? _jsx(AuthPanel, {}) : null, snapshot.interactions.map((interaction) => interaction.type === "permission" ? (_jsx(PermissionCard, { interaction: interaction, controller: controller, labels: labels }, interaction.id)) : (_jsx(ElicitationCard, { interaction: interaction, controller: controller, labels: labels }, interaction.id))), snapshot.error ? (_jsxs("aside", { className: "paui-error", role: "alert", children: [_jsxs("div", { children: [_jsx("strong", { children: labels.error }), _jsx("span", { children: snapshot.error.message })] }), snapshot.error.retryable ? (_jsx("button", { type: "button", onClick: () => runAction(() => controller.reconnect()), children: labels.retry })) : null] })) : null, actionError && !snapshot.error ? (_jsx("aside", { className: "paui-error", role: "alert", children: _jsxs("div", { children: [_jsx("strong", { children: labels.error }), _jsx("span", { children: actionError })] }) })) : null] }));
 }
+function lastTurnGroupIndex(groups) {
+    for (let index = groups.length - 1; index >= 0; index -= 1) {
+        if (groups[index]?.kind === "turn")
+            return index;
+    }
+    return -1;
+}
 function groupActivities(activities) {
     const groups = [];
-    let id = "opening";
-    let user;
-    let groupedActivities = [];
-    const flush = () => {
-        if (user || groupedActivities.length) {
-            groups.push({
-                id,
-                ...(user ? { user } : {}),
-                activities: groupedActivities,
-            });
-        }
+    let turn;
+    const flushTurn = () => {
+        if (!turn)
+            return;
+        groups.push({ kind: "turn", ...turn });
+        turn = undefined;
     };
     for (const activity of activities) {
+        if (activity.type === "notice") {
+            flushTurn();
+            const previous = groups.at(-1);
+            if (previous?.kind === "notice") {
+                groups[groups.length - 1] = {
+                    ...previous,
+                    activities: [...previous.activities, activity],
+                };
+            }
+            else {
+                groups.push({
+                    kind: "notice",
+                    id: activity.id,
+                    activities: [activity],
+                });
+            }
+            continue;
+        }
         if (activity.type === "message" && activity.role === "user") {
-            flush();
-            id = activity.id;
-            user = activity;
-            groupedActivities = [];
+            flushTurn();
+            turn = { id: activity.id, user: activity, activities: [] };
         }
         else {
-            groupedActivities.push(activity);
+            turn ??= { id: activity.id, activities: [] };
+            turn.activities.push(activity);
         }
     }
-    flush();
+    flushTurn();
     return groups;
 }
-function TurnGroup({ group, labels, toolActivityRenderer, active, }) {
-    return (_jsxs("article", { className: "paui-turn", children: [group.user ? _jsx(MessageView, { message: group.user, labels: labels }) : null, group.activities.length ? (_jsx("div", { className: "paui-activities", children: group.activities.map((activity, index) => (_jsx(ActivityRow, { activity: activity, labels: labels, toolActivityRenderer: toolActivityRenderer, running: active && index === group.activities.length - 1 }, activity.id))) })) : null] }));
+function NoticeGroup({ group, labels, }) {
+    return (_jsx("div", { className: "paui-notice-group", children: group.activities.map((activity) => (_jsx(ActivityRow, { activity: activity, labels: labels, running: false, showMessageActions: false }, activity.id))) }));
 }
-const ActivityRow = memo(function ActivityRow({ activity, labels, toolActivityRenderer, running, }) {
+function TurnGroup({ group, labels, toolActivityRenderer, active, completedAnswerIds, }) {
+    return (_jsxs("article", { className: "paui-turn", children: [group.user ? (_jsx(MessageView, { message: group.user, labels: labels, showActions: true })) : null, group.activities.length ? (_jsx("div", { className: "paui-activities", children: group.activities.map((activity, index) => (_jsx(ActivityRow, { activity: activity, labels: labels, toolActivityRenderer: toolActivityRenderer, running: active && index === group.activities.length - 1, showMessageActions: completedAnswerIds.has(activity.id) }, activity.id))) })) : null] }));
+}
+const ActivityRow = memo(function ActivityRow({ activity, labels, toolActivityRenderer, running, showMessageActions, }) {
     return (_jsx("div", { className: "paui-activity", "data-pretty-aui-slot": "activity", "data-kind": activity.type === "message"
             ? activity.role
             : activity.type === "tool" && activity.subagent
                 ? "subagent"
-                : activity.type, "data-status": activityStatus(activity), children: _jsx(ActivityView, { activity: activity, labels: labels, toolActivityRenderer: toolActivityRenderer, running: running }) }));
+                : activity.type, "data-level": activity.type === "notice" ? activity.level : undefined, "data-status": activityStatus(activity), children: _jsx(ActivityView, { activity: activity, labels: labels, toolActivityRenderer: toolActivityRenderer, running: running, showMessageActions: showMessageActions }) }));
 });
-function ActivityView({ activity, labels, toolActivityRenderer, running, }) {
+function ActivityView({ activity, labels, toolActivityRenderer, running, showMessageActions, }) {
     switch (activity.type) {
         case "message":
-            return (_jsx(MessageView, { message: activity, labels: labels, running: running }));
+            return (_jsx(MessageView, { message: activity, labels: labels, running: running, showActions: showMessageActions }));
         case "context":
             return _jsx(ContextActivity, { activity: activity, labels: labels });
+        case "notice":
+            return (_jsxs("div", { className: "paui-host-notice", role: activity.level === "error" ? "alert" : "status", children: [_jsx("span", { className: "paui-host-notice__icon", "aria-hidden": "true", children: activity.level === "error" ? _jsx(WarningIcon, {}) : _jsx(InfoIcon, {}) }), _jsx("span", { children: activity.text })] }));
         case "tool":
             if (activity.subagent) {
                 return (_jsx(SubagentActivity, { tool: activity, labels: labels, renderer: toolActivityRenderer }));
@@ -345,7 +375,7 @@ function ContextBlockView({ block, labels, }) {
         typeof block.data === "string") {
         return (_jsx("span", { className: "paui-context-meta", children: `${flowTitle(block.type, block.type)} · ${block.mimeType} · ${block.data.length.toLocaleString()} base64 characters` }));
     }
-    return (_jsx(ContextLiteralText, { text: formatRawToolValue(block), labels: labels }));
+    return _jsx(ContextLiteralText, { text: formatToolValue(block), labels: labels });
 }
 function ContextLiteralText({ text, labels, }) {
     const bounded = boundContextText(text);
@@ -407,11 +437,39 @@ function subagentStatus(tool, labels) {
         return labels.agentCancelled;
     return flowTitle(tool.status, labels.agentCompleted);
 }
-function MessageView({ message, labels, running = false, }) {
+function MessageView({ message, labels, running = false, showActions = false, }) {
     if (message.role === "thought") {
         return (_jsx(ThoughtDisclosure, { message: message, labels: labels, running: running }));
     }
-    return (_jsxs("div", { className: "paui-message", "data-pretty-aui-slot": "message", "data-role": message.role, "data-pending": message.pending || undefined, "aria-live": message.role === "assistant" && running ? "polite" : undefined, "aria-atomic": message.role === "assistant" && running ? "false" : undefined, children: [_jsx("span", { className: "paui-message__label", children: message.role === "user" ? labels.you : labels.assistantName }), _jsx("div", { className: "paui-message__content", children: message.content.map((block, index) => (_jsx(ContentView, { block: block, labels: labels }, index))) })] }));
+    return (_jsxs("div", { className: "paui-message", "data-pretty-aui-slot": "message", "data-role": message.role, "data-pending": message.pending || undefined, "data-time-hover-root": showActions || undefined, "aria-live": message.role === "assistant" && running ? "polite" : undefined, "aria-atomic": message.role === "assistant" && running ? "false" : undefined, children: [_jsxs("div", { className: "paui-message__bubble", children: [_jsx("span", { className: "paui-message__label", children: message.role === "user" ? labels.you : labels.assistantName }), _jsx("div", { className: "paui-message__content", children: message.content.map((block, index) => (_jsx(ContentView, { block: block, labels: labels }, index))) })] }), showActions ? (_jsx(MessageActions, { content: message.content, timestamp: message.timestamp, clock: message.role === "user" ? "start" : "end", labels: labels })) : null] }));
+}
+function settledAssistantMessageIds(activities, active) {
+    const settled = new Set();
+    let hasTurnActivity = false;
+    let lastAssistantId;
+    const settleTurn = () => {
+        if (lastAssistantId)
+            settled.add(lastAssistantId);
+        hasTurnActivity = false;
+        lastAssistantId = undefined;
+    };
+    for (const activity of activities) {
+        if (activity.type === "notice")
+            continue;
+        if (activity.type === "message" && activity.role === "user") {
+            if (hasTurnActivity)
+                settleTurn();
+            hasTurnActivity = true;
+            continue;
+        }
+        hasTurnActivity = true;
+        if (activity.type === "message" && activity.role === "assistant") {
+            lastAssistantId = activity.id;
+        }
+    }
+    if (!active && hasTurnActivity)
+        settleTurn();
+    return settled;
 }
 function ThoughtDisclosure({ message, labels, running, }) {
     const previewRef = useRef(null);
@@ -492,13 +550,7 @@ function ToolBody({ tool, labels, renderer, }) {
     return renderer ? (_jsx(ToolRendererBoundary, { fallback: fallback, resetKey: tool.id, children: _jsx(CustomToolBody, { tool: tool, renderer: renderer, fallback: fallback }) }, tool.id)) : (fallback);
 }
 function DefaultToolBody({ tool, labels, }) {
-    if (tool.content.length) {
-        return tool.content.map((content, index) => (_jsx(ToolContentView, { value: content, labels: labels }, index)));
-    }
-    if (tool.rawInput === undefined && tool.rawOutput === undefined) {
-        return _jsx("span", { className: "paui-muted", children: labels.tool });
-    }
-    return (_jsxs("div", { className: "paui-tool-raw", children: [tool.rawInput !== undefined ? (_jsxs("section", { children: [_jsx("strong", { children: labels.toolInput }), _jsx("pre", { children: formatRawToolValue(tool.rawInput) })] })) : null, tool.rawOutput !== undefined ? (_jsxs("section", { children: [_jsx("strong", { children: labels.toolOutput }), _jsx("pre", { children: formatRawToolValue(tool.rawOutput) })] })) : null] }));
+    return (_jsx(BuiltInToolBody, { tool: tool, labels: labels, renderContent: (value, key) => (_jsx(ToolContentView, { value: value, labels: labels }, key)) }));
 }
 function CustomToolBody({ tool, renderer, fallback, }) {
     const rendered = renderer(tool);
@@ -591,7 +643,7 @@ export function ChatComposer() {
     const sessionKey = sessionCacheKey(snapshot);
     const sessionRef = useRef(sessionKey);
     const draftsRef = useRef(new Map());
-    const placement = snapshot.activities.length ||
+    const placement = snapshot.activities.some((activity) => activity.type !== "notice") ||
         snapshot.interactions.length ||
         snapshot.phase === "auth_required" ||
         snapshot.error
@@ -710,7 +762,102 @@ export function ChatComposer() {
 }
 function ConfigBar({ controller, options, }) {
     const { runAction } = useChatContext("ChatComposer");
-    return (_jsx("div", { className: "paui-config", children: options.map((option) => option.type === "boolean" ? (_jsxs("label", { title: option.description, children: [_jsx("input", { type: "checkbox", checked: Boolean(option.currentValue), onChange: (event) => runAction(() => controller.setConfigOption(option.id, event.target.checked)) }), _jsx("span", { children: option.name })] }, option.id)) : option.type === "select" ? (_jsxs("label", { title: option.description, children: [_jsx("span", { className: "paui-sr-only", children: option.name }), _jsx("select", { value: String(option.currentValue), onChange: (event) => runAction(() => controller.setConfigOption(option.id, event.target.value)), children: option.options?.map((choice) => (_jsx("option", { value: choice.value, children: choice.name }, choice.value))) })] }, option.id)) : null) }));
+    return (_jsx("div", { className: "paui-config", children: options.map((option) => option.type === "boolean" ? (_jsxs("label", { title: option.description, children: [_jsx("input", { type: "checkbox", checked: Boolean(option.currentValue), onChange: (event) => runAction(() => controller.setConfigOption(option.id, event.target.checked)) }), _jsx("span", { children: option.name })] }, option.id)) : option.type === "select" ? (_jsx(ConfigSelect, { controller: controller, option: option }, option.id)) : null) }));
+}
+function ConfigSelect({ controller, option, }) {
+    const { runAction } = useChatContext("ChatComposer");
+    const rootRef = useRef(null);
+    const triggerRef = useRef(null);
+    const listboxRef = useRef(null);
+    const id = useId().replaceAll(":", "");
+    const listboxId = `paui-config-${id}`;
+    const choices = option.options ?? [];
+    const selectedIndex = choices.findIndex((choice) => choice.value === String(option.currentValue));
+    const selected = selectedIndex >= 0 ? choices[selectedIndex] : undefined;
+    const [open, setOpen] = useState(false);
+    const [activeIndex, setActiveIndex] = useState(Math.max(0, selectedIndex));
+    const openList = (index = Math.max(0, selectedIndex)) => {
+        if (!choices.length)
+            return;
+        setActiveIndex(index);
+        setOpen(true);
+    };
+    const closeList = (restoreFocus = false) => {
+        setOpen(false);
+        if (restoreFocus)
+            triggerRef.current?.focus();
+    };
+    const choose = (index) => {
+        const choice = choices[index];
+        if (!choice)
+            return;
+        closeList(true);
+        if (choice.value !== String(option.currentValue)) {
+            runAction(() => controller.setConfigOption(option.id, choice.value));
+        }
+    };
+    const move = (delta) => {
+        if (!choices.length)
+            return;
+        setActiveIndex((index) => (index + delta + choices.length) % choices.length);
+    };
+    useEffect(() => {
+        if (!open)
+            return;
+        const onPointerDown = (event) => {
+            if (rootRef.current && event.composedPath().includes(rootRef.current)) {
+                return;
+            }
+            setOpen(false);
+        };
+        window.addEventListener("pointerdown", onPointerDown, true);
+        return () => window.removeEventListener("pointerdown", onPointerDown, true);
+    }, [open]);
+    useEffect(() => {
+        if (!open)
+            return;
+        const activeOption = listboxRef.current?.querySelector(`#${listboxId}-option-${activeIndex}`);
+        activeOption?.scrollIntoView?.({ block: "nearest" });
+    }, [activeIndex, listboxId, open]);
+    const onKeyDown = (event) => {
+        if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+            event.preventDefault();
+            const delta = event.key === "ArrowDown" ? 1 : -1;
+            if (!open) {
+                const start = selectedIndex >= 0 ? selectedIndex : 0;
+                openList((start + delta + choices.length) % choices.length);
+            }
+            else
+                move(delta);
+            return;
+        }
+        if (event.key === "Home" && open) {
+            event.preventDefault();
+            setActiveIndex(0);
+            return;
+        }
+        if (event.key === "End" && open) {
+            event.preventDefault();
+            setActiveIndex(Math.max(0, choices.length - 1));
+            return;
+        }
+        if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            if (open)
+                choose(activeIndex);
+            else
+                openList();
+            return;
+        }
+        if (event.key === "Escape" && open) {
+            event.preventDefault();
+            closeList(true);
+            return;
+        }
+        if (event.key === "Tab")
+            closeList();
+    };
+    return (_jsxs("div", { className: "paui-config__field", ref: rootRef, children: [_jsxs("button", { ref: triggerRef, className: "paui-config__trigger", type: "button", role: "combobox", "aria-label": option.name, "aria-controls": open ? listboxId : undefined, "aria-expanded": open, "aria-haspopup": "listbox", "aria-activedescendant": open ? `${listboxId}-option-${activeIndex}` : undefined, title: option.description, disabled: !choices.length, onClick: () => (open ? closeList() : openList()), onKeyDown: onKeyDown, children: [_jsx("span", { children: selected?.name ?? String(option.currentValue) }), _jsx(ChevronIcon, {})] }), open ? (_jsx("div", { ref: listboxRef, className: "paui-config__listbox", id: listboxId, role: "listbox", "aria-label": option.name, children: choices.map((choice, index) => (_jsxs("button", { id: `${listboxId}-option-${index}`, className: "paui-config__option", type: "button", role: "option", "aria-selected": choice.value === String(option.currentValue), "data-active": index === activeIndex || undefined, title: choice.description, tabIndex: -1, onMouseMove: index === activeIndex ? undefined : () => setActiveIndex(index), onMouseDown: (event) => event.preventDefault(), onClick: () => choose(index), children: [_jsx("span", { children: choice.name }), _jsx("span", { className: "paui-config__check", "aria-hidden": "true", children: choice.value === String(option.currentValue) ? (_jsx(ConfigCheckIcon, {})) : null })] }, choice.value))) })) : null] }));
 }
 function PermissionCard({ interaction, controller, labels, }) {
     const { ids } = useChatContext("ChatInteractions");
@@ -803,9 +950,27 @@ function SessionDrawer({ controller, snapshot, labels, onClose, }) {
     const { ids } = useChatContext("ChatHeader");
     const closeRef = useRef(null);
     const dialogRef = useRef(null);
+    const menuRef = useRef(null);
+    const menuItemRef = useRef(null);
+    const menuTriggerRef = useRef(null);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState();
+    const [menuSessionId, setMenuSessionId] = useState();
+    const [menuPosition, setMenuPosition] = useState();
     const sessions = mergeDrawerSessions(snapshot);
+    const menuSession = sessions.find((session) => session.sessionId === menuSessionId);
+    const drawerNow = Date.now();
+    const menuDeleteDisabled = loading ||
+        menuSession?.loaded?.phase === "running" ||
+        menuSession?.loaded?.phase === "cancelling" ||
+        (menuSession?.loaded?.interactionCount ?? 0) > 0;
+    const closeMenu = useCallback((restoreFocus = false) => {
+        const trigger = menuTriggerRef.current;
+        setMenuSessionId(undefined);
+        setMenuPosition(undefined);
+        if (restoreFocus && trigger?.isConnected)
+            trigger.focus();
+    }, []);
     useEffect(() => {
         const activeElement = activeElementFor(dialogRef.current);
         const previousFocus = activeElement instanceof HTMLElement ? activeElement : undefined;
@@ -824,10 +989,61 @@ function SessionDrawer({ controller, snapshot, labels, onClose, }) {
                 .finally(() => setLoading(false));
         }
     }, [controller, snapshot.capabilities.listSessions, snapshot.sessions]);
+    useLayoutEffect(() => {
+        if (!menuSessionId)
+            return;
+        const drawer = dialogRef.current;
+        const menu = menuRef.current;
+        const trigger = menuTriggerRef.current;
+        if (!drawer || !menu || !trigger)
+            return;
+        const drawerRect = drawer.getBoundingClientRect();
+        const menuRect = menu.getBoundingClientRect();
+        const triggerRect = trigger.getBoundingClientRect();
+        const margin = 8;
+        const gap = 4;
+        const maxLeft = Math.max(margin, drawerRect.width - menuRect.width - margin);
+        const left = Math.min(Math.max(triggerRect.right - drawerRect.left - menuRect.width, margin), maxLeft);
+        const below = triggerRect.bottom - drawerRect.top + gap;
+        const above = triggerRect.top - drawerRect.top - menuRect.height - gap;
+        const preferredTop = below + menuRect.height <= drawerRect.height - margin ? below : above;
+        const maxTop = Math.max(margin, drawerRect.height - menuRect.height - margin);
+        const top = Math.min(Math.max(preferredTop, margin), maxTop);
+        setMenuPosition({ left, top });
+    }, [menuSessionId]);
+    useLayoutEffect(() => {
+        if (menuSessionId && menuPosition)
+            menuItemRef.current?.focus();
+    }, [menuPosition, menuSessionId]);
+    useEffect(() => {
+        if (!menuSessionId)
+            return;
+        const onPointerDown = (event) => {
+            const path = event.composedPath();
+            if ((menuRef.current && path.includes(menuRef.current)) ||
+                (menuTriggerRef.current && path.includes(menuTriggerRef.current)))
+                return;
+            closeMenu();
+        };
+        const onGeometryChange = () => closeMenu();
+        window.addEventListener("pointerdown", onPointerDown, true);
+        window.addEventListener("scroll", onGeometryChange, true);
+        window.addEventListener("resize", onGeometryChange);
+        return () => {
+            window.removeEventListener("pointerdown", onPointerDown, true);
+            window.removeEventListener("scroll", onGeometryChange, true);
+            window.removeEventListener("resize", onGeometryChange);
+        };
+    }, [closeMenu, menuSessionId]);
     useEffect(() => {
         const onKey = (event) => {
             if (event.key === "Escape") {
                 event.preventDefault();
+                if (menuSessionId) {
+                    event.stopPropagation();
+                    closeMenu(true);
+                    return;
+                }
                 onClose();
                 return;
             }
@@ -857,9 +1073,9 @@ function SessionDrawer({ controller, snapshot, labels, onClose, }) {
                 first.focus();
             }
         };
-        window.addEventListener("keydown", onKey);
-        return () => window.removeEventListener("keydown", onKey);
-    }, [onClose]);
+        window.addEventListener("keydown", onKey, true);
+        return () => window.removeEventListener("keydown", onKey, true);
+    }, [closeMenu, menuSessionId, onClose]);
     const select = async (sessionId) => {
         setLoading(true);
         setError(undefined);
@@ -887,11 +1103,17 @@ function SessionDrawer({ controller, snapshot, labels, onClose, }) {
             setLoading(false);
         }
     };
-    const closeSession = async (sessionId) => {
+    const deleteSession = async (session) => {
+        const title = session.title ?? labels.sessionUntitled;
+        if (!window.confirm(labels.confirmDeleteSession(title))) {
+            closeMenu(true);
+            return;
+        }
+        closeMenu();
         setLoading(true);
         setError(undefined);
         try {
-            await controller.closeSession(sessionId);
+            await controller.deleteSession(session.sessionId);
         }
         catch (reason) {
             setError(reason instanceof Error ? reason.message : String(reason));
@@ -903,20 +1125,30 @@ function SessionDrawer({ controller, snapshot, labels, onClose, }) {
     return (_jsx("div", { className: "paui-drawer-backdrop", role: "presentation", onMouseDown: (event) => {
             if (event.target === event.currentTarget)
                 onClose();
-        }, children: _jsxs("aside", { ref: dialogRef, className: "paui-drawer", role: "dialog", "aria-modal": "true", "aria-labelledby": ids.sessionsTitle, children: [_jsxs("header", { children: [_jsx("strong", { id: ids.sessionsTitle, children: labels.sessions }), _jsxs("button", { ref: closeRef, className: "paui-icon-button", type: "button", onClick: onClose, children: [_jsx(CloseIcon, {}), _jsx("span", { className: "paui-sr-only", children: labels.close })] })] }), _jsxs("div", { className: "paui-session-list", children: [loading && !snapshot.sessions ? (_jsx("span", { className: "paui-muted", children: "\u2026" })) : null, !loading && !sessions.length ? (_jsx("span", { className: "paui-muted", children: labels.noSessions })) : null, sessions.map((session) => (_jsxs("div", { className: "paui-session", "data-active": session.sessionId === snapshot.sessionId || undefined, children: [_jsxs("button", { type: "button", disabled: loading || session.sessionId === snapshot.sessionId, onClick: () => void select(session.sessionId), children: [_jsx("strong", { children: session.title ?? labels.sessionUntitled }), _jsxs("span", { className: "paui-session__meta", children: [session.loaded
-                                                    ? labels.sessionPhase(session.loaded.phase)
-                                                    : formatSessionDate(session.updatedAt), session.loaded?.interactionCount ? (_jsx("span", { children: labels.pendingInteractions(session.loaded.interactionCount) })) : null] })] }), session.loaded && snapshot.capabilities.closeSession ? (_jsxs("button", { className: "paui-icon-button", type: "button", disabled: loading ||
-                                        session.loaded.phase === "running" ||
-                                        session.loaded.phase === "cancelling" ||
-                                        session.loaded.interactionCount > 0, title: labels.closeSession, onClick: () => void closeSession(session.sessionId), children: [_jsx(CloseIcon, {}), _jsx("span", { className: "paui-sr-only", children: labels.closeSession })] })) : snapshot.capabilities.deleteSession &&
-                                    session.sessionId !== snapshot.sessionId ? (_jsxs("button", { className: "paui-icon-button", type: "button", title: labels.deleteSession, onClick: () => {
-                                        if (window.confirm(labels.confirmDeleteSession(session.title ?? labels.sessionUntitled)))
-                                            void controller
-                                                .deleteSession(session.sessionId)
-                                                .catch((reason) => setError(reason instanceof Error
-                                                ? reason.message
-                                                : String(reason)));
-                                    }, children: [_jsx(TrashIcon, {}), _jsx("span", { className: "paui-sr-only", children: labels.deleteSession })] })) : null] }, session.sessionId))), snapshot.sessions?.nextCursor ? (_jsx("button", { className: "paui-load-more", type: "button", disabled: loading, onClick: () => void loadMore(snapshot.sessions?.nextCursor), children: labels.loadMore })) : null, error ? (_jsx("span", { className: "paui-error-text", role: "alert", children: error })) : null] })] }) }));
+        }, children: _jsxs("aside", { ref: dialogRef, className: "paui-drawer", role: "dialog", "aria-modal": "true", "aria-labelledby": ids.sessionsTitle, children: [_jsxs("header", { children: [_jsx("strong", { id: ids.sessionsTitle, children: labels.sessions }), _jsxs("button", { ref: closeRef, className: "paui-icon-button", type: "button", onClick: onClose, children: [_jsx(CloseIcon, {}), _jsx("span", { className: "paui-sr-only", children: labels.close })] })] }), _jsxs("div", { className: "paui-session-list", children: [loading && !snapshot.sessions ? (_jsx("span", { className: "paui-muted", children: "\u2026" })) : null, !loading && !sessions.length ? (_jsx("span", { className: "paui-muted", children: labels.noSessions })) : null, sessions.map((session) => {
+                            const active = session.sessionId === snapshot.sessionId;
+                            const title = session.title ?? labels.sessionUntitled;
+                            const hasActions = snapshot.capabilities.deleteSession && !active;
+                            const menuOpen = session.sessionId === menuSessionId;
+                            return (_jsxs("div", { className: "paui-session", "data-active": active || undefined, "data-has-actions": hasActions || undefined, "data-loaded": session.loaded !== undefined || undefined, "data-menu-open": menuOpen || undefined, children: [_jsxs("button", { className: "paui-session__select", type: "button", "aria-current": active ? "page" : undefined, disabled: loading || active, onClick: () => void select(session.sessionId), children: [session.loaded?.phase === "running" ? (_jsx("span", { className: "paui-session__spinner", "aria-hidden": "true" })) : null, _jsx("strong", { className: "paui-session__title", children: title })] }), _jsxs("span", { className: "paui-session__trailing", children: [_jsxs("span", { className: "paui-session__meta", children: [_jsx("span", { children: session.loaded
+                                                            ? labels.sessionPhase(session.loaded.phase)
+                                                            : formatSessionAge(session.updatedAt, drawerNow, labels.sessionAge) }), session.loaded?.interactionCount ? (_jsxs(_Fragment, { children: [_jsx("span", { className: "paui-session__meta-separator", "aria-hidden": "true", children: "\u00B7" }), _jsx("span", { children: labels.pendingInteractions(session.loaded.interactionCount) })] })) : null] }), hasActions ? (_jsx("button", { className: "paui-session__action", type: "button", "aria-controls": menuOpen ? `${ids.instance}-session-menu` : undefined, "aria-expanded": menuOpen, "aria-haspopup": "menu", "aria-label": labels.sessionActions(title), disabled: loading, onClick: (event) => {
+                                                    event.stopPropagation();
+                                                    if (menuOpen) {
+                                                        closeMenu(true);
+                                                        return;
+                                                    }
+                                                    menuTriggerRef.current = event.currentTarget;
+                                                    setMenuPosition(undefined);
+                                                    setMenuSessionId(session.sessionId);
+                                                }, children: _jsx(EllipsisIcon, {}) })) : null] })] }, session.sessionId));
+                        }), snapshot.sessions?.nextCursor ? (_jsx("button", { className: "paui-load-more", type: "button", disabled: loading, onClick: () => void loadMore(snapshot.sessions?.nextCursor), children: labels.loadMore })) : null, error ? (_jsx("span", { className: "paui-error-text", role: "alert", children: error })) : null] }), menuSession &&
+                    snapshot.capabilities.deleteSession &&
+                    menuSession.sessionId !== snapshot.sessionId ? (_jsx("div", { ref: menuRef, id: `${ids.instance}-session-menu`, className: "paui-session-menu", role: "menu", "aria-label": labels.sessionActions(menuSession.title ?? labels.sessionUntitled), style: menuPosition ?? { visibility: "hidden" }, children: _jsxs("button", { ref: menuItemRef, type: "button", role: "menuitem", "aria-disabled": menuDeleteDisabled, onClick: () => {
+                            if (menuDeleteDisabled)
+                                return;
+                            void deleteSession(menuSession);
+                        }, children: [_jsx(TrashIcon, {}), _jsx("span", { children: labels.deleteSession })] }) })) : null] }) }));
 }
 function mergeDrawerSessions(snapshot) {
     const catalog = new Map((snapshot.sessions?.sessions ?? []).map((session) => [
@@ -939,19 +1171,6 @@ function activeElementFor(element) {
         return root.activeElement;
     }
     return document.activeElement;
-}
-function formatRawToolValue(value) {
-    const rendered = typeof value === "string"
-        ? value
-        : (() => {
-            try {
-                return JSON.stringify(value, null, 2) ?? String(value);
-            }
-            catch {
-                return String(value);
-            }
-        })();
-    return rendered.slice(0, 100_000);
 }
 const markdown = new Marked({ gfm: true, breaks: true });
 const FOCUSABLE_SELECTOR = 'a[href], button, input, select, textarea, [tabindex]:not([tabindex="-1"])';
@@ -1070,22 +1289,33 @@ function activityStatus(activity) {
             return activity.pending ? "pending" : undefined;
         case "unsupported":
             return "unsupported";
+        case "context":
+        case "notice":
+            return undefined;
     }
 }
-function formatSessionDate(value) {
+export function formatSessionAge(value, now = Date.now(), format = defaultLabels.sessionAge) {
     if (!value)
         return "";
-    const date = new Date(value);
-    return Number.isNaN(date.valueOf())
-        ? value
-        : SESSION_DATE_FORMATTER.format(date);
+    const at = new Date(value).valueOf();
+    if (Number.isNaN(at))
+        return value;
+    const minute = 60_000;
+    const hour = 60 * minute;
+    const day = 24 * hour;
+    const diff = Math.max(0, now - at);
+    if (diff < minute)
+        return format(0, "now");
+    if (diff < hour)
+        return format(Math.floor(diff / minute), "minute");
+    if (diff < day)
+        return format(Math.floor(diff / hour), "hour");
+    if (diff < 30 * day)
+        return format(Math.floor(diff / day), "day");
+    if (diff < 365 * day)
+        return format(Math.floor(diff / (30 * day)), "month");
+    return format(Math.floor(diff / (365 * day)), "year");
 }
-const SESSION_DATE_FORMATTER = new Intl.DateTimeFormat(undefined, {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-});
 function isRecord(value) {
     return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -1098,12 +1328,14 @@ function Icon({ children }) {
 const HistoryIcon = () => (_jsx(Icon, { children: _jsx("path", { d: "M3 10a7 7 0 1 0 2-4.9M3 3v4h4M10 6v4l3 2" }) }));
 const NewChatIcon = () => (_jsx(Icon, { children: _jsx("path", { d: "M4 4h8a3 3 0 0 1 3 3v4a3 3 0 0 1-3 3H8l-4 3v-3a3 3 0 0 1-1-2V7a3 3 0 0 1 3-3M10 7v5M7.5 9.5h5" }) }));
 const CloseIcon = () => (_jsx(Icon, { children: _jsx("path", { d: "m5 5 10 10M15 5 5 15" }) }));
+const EllipsisIcon = () => (_jsxs(Icon, { children: [_jsx("circle", { cx: "5", cy: "10", r: "1", fill: "currentColor", stroke: "none" }), _jsx("circle", { cx: "10", cy: "10", r: "1", fill: "currentColor", stroke: "none" }), _jsx("circle", { cx: "15", cy: "10", r: "1", fill: "currentColor", stroke: "none" })] }));
 const TrashIcon = () => (_jsx(Icon, { children: _jsx("path", { d: "M4 6h12M8 3h4l1 3M6 6l1 11h6l1-11M9 9v5M12 9v5" }) }));
 const SendIcon = () => (_jsx("svg", { viewBox: "0 0 16 16", "aria-hidden": "true", focusable: "false", children: _jsx("path", { d: "M8.3125.9802c.3552.0729.6665.224 0.9502.4521.2245.1807.4676.4256.7168.6748L14.707 6.8347 13.293 8.2487 9 3.9558v11.0859H7V3.9558L2.707 8.2487 1.293 6.8347l4.7275-4.7276c.2492-.2492.4923-.4941.7168-.6748.2393-.1924.5471-.3883.9502-.4521.2098-.0332.4156-.025.625 0Z", fill: "currentColor" }) }));
 const StopIcon = () => (_jsx("svg", { viewBox: "0 0 16 16", "aria-hidden": "true", focusable: "false", children: _jsx("rect", { x: "3", y: "3", width: "10", height: "10", rx: "3", fill: "currentColor" }) }));
 const DownIcon = () => (_jsx(Icon, { children: _jsx("path", { d: "m5 8 5 5 5-5" }) }));
 const BackIcon = () => (_jsx(Icon, { children: _jsx("path", { d: "m12.5 4.5-5 5 5 5" }) }));
 const ChevronIcon = () => (_jsx("svg", { viewBox: "0 0 14 14", "aria-hidden": "true", focusable: "false", children: _jsx("path", { d: "m4 5.5 3 3 3-3" }) }));
+const ConfigCheckIcon = () => (_jsx("svg", { viewBox: "0 0 14 14", "aria-hidden": "true", focusable: "false", children: _jsx("path", { d: "m3 7 2.5 2.5L11 4" }) }));
 const ToolIcon = () => (_jsx(Icon, { children: _jsx("path", { d: "M12.5 4.2a4 4 0 0 0-5 5L3 13.7 6.3 17l4.5-4.5a4 4 0 0 0 5-5l-2.3 2.3-3.3-3.3 2.3-2.3Z" }) }));
 const AgentIcon = () => (_jsxs(Icon, { children: [_jsx("circle", { cx: "10", cy: "5", r: "2" }), _jsx("circle", { cx: "5", cy: "14", r: "2" }), _jsx("circle", { cx: "15", cy: "14", r: "2" }), _jsx("path", { d: "m8.8 6.7-2.6 5.6M11.2 6.7l2.6 5.6M7 14h6" })] }));
 const OpenChildIcon = () => (_jsx(Icon, { children: _jsx("path", { d: "M5 5h5v5M10 5 4.5 10.5M9 9h6v6H9" }) }));
@@ -1118,6 +1350,7 @@ const FileIcon = () => (_jsx(Icon, { children: _jsx("path", { d: "M5 2h7l4 4v12H
 const DiffIcon = () => (_jsx(Icon, { children: _jsx("path", { d: "M5 3v14M3 5l2-2 2 2M15 17V3M13 15l2 2 2-2M9 7h3M9 13h3" }) }));
 const ContextIcon = () => (_jsx(Icon, { children: _jsx("path", { d: "M6 5h10v10H6zM3 8v9h9" }) }));
 const InfoIcon = () => (_jsxs(Icon, { children: [_jsx("circle", { cx: "10", cy: "10", r: "7" }), _jsx("path", { d: "M10 9v5M10 6h.01" })] }));
+const WarningIcon = () => (_jsxs(Icon, { children: [_jsx("path", { d: "M10 2 19 18H1L10 2Z" }), _jsx("path", { d: "M10 7v5M10 15h.01" })] }));
 const SparkIcon = () => (_jsx(Icon, { children: _jsx("path", { d: "m10 2 1.5 4.5L16 8l-4.5 1.5L10 14l-1.5-4.5L4 8l4.5-1.5L10 2ZM15.5 13l.7 2.3 2.3.7-2.3.7-.7 2.3-.7-2.3-2.3-.7 2.3-.7.7-2.3Z" }) }));
 const FormIcon = () => (_jsx(Icon, { children: _jsx("path", { d: "M4 3h12v14H4zM7 7h6M7 10h6M7 13h3" }) }));
 //# sourceMappingURL=Chat.js.map

@@ -10,9 +10,10 @@ export function wireMessageWithinBudget(value, limit = MAX_WIRE_MESSAGE_BYTES) {
     }
     if (serialized === undefined)
         return false;
-    return utf8ByteLength(serialized, limit) <= limit;
+    return utf8StringWithinBudget(serialized, limit);
 }
-function utf8ByteLength(value, limit) {
+/** Checks a string without scanning beyond the first byte over the limit. */
+export function utf8StringWithinBudget(value, limit) {
     let bytes = 0;
     for (let index = 0; index < value.length; index += 1) {
         const code = value.charCodeAt(index);
@@ -32,8 +33,8 @@ function utf8ByteLength(value, limit) {
             bytes += 3;
         }
         if (bytes > limit)
-            return bytes;
+            return false;
     }
-    return bytes;
+    return true;
 }
 //# sourceMappingURL=wire-budget.js.map

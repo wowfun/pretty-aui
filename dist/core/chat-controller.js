@@ -1,8 +1,9 @@
 import { PrettyAuiError, toChatError } from "./errors.js";
+import { createUserMessageEnvelopeToken, envelopeUserPrompt, } from "./prompt-envelope.js";
 import { connectProtocol } from "./protocol/connect.js";
 import { boundedRecord, isRecord, TimelineStore, } from "./protocol/normalize.js";
 import { validatePrompt } from "./protocol/types.js";
-import { wireMessageWithinBudget } from "./wire-budget.js";
+import { utf8StringWithinBudget, wireMessageWithinBudget, } from "./wire-budget.js";
 const NO_CAPABILITIES = {
     listSessions: false,
     loadSession: false,
@@ -10,6 +11,8 @@ const NO_CAPABILITIES = {
     closeSession: false,
     deleteSession: false,
 };
+const MAX_MODEL_PREFERENCE_LENGTH = 16 * 1024;
+const MAX_NOTICE_LENGTH = 16 * 1024;
 /**
  * Creates a framework-neutral chat controller and starts ACP initialization.
  *
@@ -44,11 +47,13 @@ class DefaultChatController {
     #connectionPhase = "connecting";
     #connectionError;
     #sessionTrail = [];
+    #modelPreference;
     #newSessionMutation;
     #sessionMutations = new Map();
     #sessionListRequest;
     constructor(options) {
         this.#options = options;
+        this.#modelPreference = this.#readModelPreference();
         this.#contextSelection = readContextSelection(options.context);
         this.#snapshot = {
             phase: "connecting",
@@ -79,6 +84,34 @@ class DefaultChatController {
     subscribe(listener) {
         this.#listeners.add(listener);
         return () => this.#listeners.delete(listener);
+    }
+    appendNotice(input) {
+        if (this.#destroyed)
+            return false;
+        if (!isRecord(input) ||
+            typeof input.text !== "string" ||
+            input.text.length === 0 ||
+            !utf8StringWithinBudget(input.text, MAX_NOTICE_LENGTH) ||
+            (input.level !== "info" && input.level !== "error") ||
+            (input.sessionId !== undefined &&
+                (typeof input.sessionId !== "string" ||
+                    input.sessionId.trim().length === 0))) {
+            throw new PrettyAuiError("INVALID_CONFIGURATION", `Notice text must contain 1 to ${MAX_NOTICE_LENGTH} UTF-8 bytes, use an info or error level, and target a non-empty session ID when provided`, { phase: "notice" });
+        }
+        const sessionId = input.sessionId ?? this.#snapshot.sessionId;
+        if (!sessionId)
+            return false;
+        const session = this.#sessions.get(sessionId);
+        if (!session)
+            return false;
+        session.timeline.addNotice({
+            type: "notice",
+            id: `host-notice-${++this.#counter}`,
+            text: input.text,
+            level: input.level,
+        });
+        this.#refreshSession(session);
+        return true;
     }
     send(input) {
         this.#assertUsableSession();
@@ -121,7 +154,7 @@ class DefaultChatController {
         };
         session.activeTurn = turn;
         session.timeline.beginTurn();
-        session.timeline.addUserMessage(blocks, true);
+        session.timeline.addUserMessage(blocks, true, Date.now());
         session.phase = "running";
         session.stopReason = undefined;
         session.error = undefined;
@@ -183,8 +216,7 @@ class DefaultChatController {
         try {
             await this.#withNewSessionOperation("session/new", async () => {
                 const driver = this.#requireDriver();
-                const session = await driver.newSession(this.#options.session);
-                this.#assertDriverCurrent(driver);
+                const session = await this.#newSession(driver);
                 const managed = this.#createSession(session);
                 this.#selectSession(managed);
             });
@@ -333,6 +365,7 @@ class DefaultChatController {
             session.configOptions = returned.length
                 ? returned
                 : session.configOptions.map((option) => option.id === id ? { ...option, currentValue: value } : option);
+            this.#syncModelPreference(session);
             this.#refreshSession(session);
         });
     }
@@ -351,8 +384,7 @@ class DefaultChatController {
             try {
                 await driver.authenticate(method);
                 this.#assertDriverCurrent(driver);
-                const session = await driver.newSession(this.#options.session);
-                this.#assertDriverCurrent(driver);
+                const session = await this.#newSession(driver);
                 this.#connectionPhase = "ready";
                 const managed = this.#createSession(session);
                 this.#selectSession(managed);
@@ -584,7 +616,7 @@ class DefaultChatController {
                     this.#publish();
                     return;
                 }
-                const opened = await driver.newSession(this.#options.session);
+                const opened = await this.#newSession(driver);
                 this.#assertConnectionCurrent(generation, driver);
                 this.#sessions.clear();
                 this.#connectionPhase = "ready";
@@ -598,7 +630,7 @@ class DefaultChatController {
             }
             if (!driver.initialized.capabilities.resumeSession &&
                 !driver.initialized.capabilities.loadSession) {
-                const opened = await driver.newSession(this.#options.session);
+                const opened = await this.#newSession(driver);
                 this.#assertConnectionCurrent(generation, driver);
                 this.#sessions.clear();
                 this.#connectionPhase = "ready";
@@ -628,6 +660,9 @@ class DefaultChatController {
                     this.#staging.set(oldSession.sessionId, staging);
                     const restored = await driver.openSession(oldSession.sessionId, this.#options.session, history);
                     this.#assertConnectionCurrent(generation, driver);
+                    if (history === "all") {
+                        this.#applyStagingEffect(staging, timeline.finalizeReplay());
+                    }
                     const managed = this.#createSession(restored, timeline, staging, oldSession.instanceId);
                     managed.lastSelected = oldSession.lastSelected;
                     managed.usage = oldSession.usage;
@@ -687,9 +722,12 @@ class DefaultChatController {
                 ...item,
                 content: item.content.map((block) => withContextMeta(block, item)),
             }));
+            const promptInput = submittedContext.length
+                ? envelopeUserPrompt(input, createUserMessageEnvelopeToken())
+                : input;
             const prompt = [
                 ...submittedContext.flatMap((item) => item.content),
-                ...input,
+                ...promptInput,
             ];
             validatePrompt(prompt, driver.initialized.promptCapabilities, driver.version);
             if (!wireMessageWithinBudget({
@@ -715,8 +753,10 @@ class DefaultChatController {
                 return this.#completeTurn(turn, "cancelled");
             }
             const session = this.#sessions.get(turn.sessionId);
-            if (session?.activeTurn === turn)
+            if (session?.activeTurn === turn) {
                 session.activeTurn = undefined;
+                session.timeline.finishTurn();
+            }
             this.#fail(error, turn.sessionId);
             throw error;
         }
@@ -797,6 +837,7 @@ class DefaultChatController {
         try {
             const session = await driver.openSession(sessionId, this.#options.session, "all");
             this.#assertDriverCurrent(driver);
+            this.#applyStagingEffect(staging, staging.timeline.finalizeReplay());
             const managed = this.#createSession(session, staging.timeline, staging);
             if (selectionRequest === this.#selectionRequest) {
                 this.#selectSession(managed, sessionTrail);
@@ -808,6 +849,42 @@ class DefaultChatController {
         finally {
             if (this.#staging.get(sessionId) === staging)
                 this.#staging.delete(sessionId);
+        }
+    }
+    async #newSession(driver) {
+        const session = await driver.newSession(this.#options.session);
+        this.#assertDriverCurrent(driver);
+        const model = findModelOption(session.configOptions);
+        const preferred = this.#modelPreference;
+        if (!model ||
+            !preferred ||
+            model.currentValue === preferred ||
+            !model.options?.some((option) => option.value === preferred)) {
+            return session;
+        }
+        try {
+            const returned = await driver.setConfigOption(session.sessionId, model.id, preferred);
+            this.#assertDriverCurrent(driver);
+            return {
+                ...session,
+                configOptions: returned.length
+                    ? returned
+                    : session.configOptions.map((option) => option.id === model.id
+                        ? { ...option, currentValue: preferred }
+                        : option),
+            };
+        }
+        catch (error) {
+            this.#assertDriverCurrent(driver);
+            if (this.#connectionPhase === "error")
+                throw connectionClosedError();
+            this.#emit({
+                type: "diagnostic",
+                sessionId: session.sessionId,
+                code: "MODEL_PREFERENCE_APPLY_FAILED",
+                message: "The preferred model could not be applied; using the Agent default",
+            });
+            return session;
         }
     }
     #applyEffect(session, effect) {
@@ -856,6 +933,7 @@ class DefaultChatController {
                 message: effect.unsupported,
             });
         }
+        this.#emitTimelineDiagnostics(session.sessionId, effect);
         return summaryChanged;
     }
     #hasInteractionCapacity() {
@@ -875,6 +953,17 @@ class DefaultChatController {
             staging.configOptions = effect.configOptions;
         if (effect.sessionTitle !== undefined)
             staging.sessionTitle = effect.sessionTitle ?? undefined;
+        this.#emitTimelineDiagnostics(staging.sessionId, effect);
+    }
+    #emitTimelineDiagnostics(sessionId, effect) {
+        for (const diagnostic of effect.diagnostics ?? []) {
+            this.#emit({
+                type: "diagnostic",
+                sessionId,
+                code: diagnostic.code,
+                message: diagnostic.message,
+            });
+        }
     }
     #addInteraction(interaction, sessionId) {
         if (sessionId === undefined) {
@@ -1063,6 +1152,7 @@ class DefaultChatController {
     }
     #selectSession(session, trail = []) {
         session.lastSelected = ++this.#selectionCounter;
+        this.#syncModelPreference(session);
         this.#sessionTrail = [...trail];
         this.#snapshot = cleanSnapshot({
             ...this.#snapshot,
@@ -1081,9 +1171,57 @@ class DefaultChatController {
         this.#emit({ type: "session_changed" });
     }
     #refreshSession(session, summaryChanged = false) {
-        if (this.#snapshot.sessionId === session.sessionId || summaryChanged) {
+        if (this.#snapshot.sessionId === session.sessionId) {
+            this.#syncModelPreference(session);
             this.#publish();
         }
+        else if (summaryChanged) {
+            this.#publish();
+        }
+    }
+    #syncModelPreference(session) {
+        const model = findModelOption(session.configOptions);
+        if (!model ||
+            typeof model.currentValue !== "string" ||
+            !validModelPreference(model.currentValue) ||
+            this.#modelPreference === model.currentValue)
+            return;
+        this.#modelPreference = model.currentValue;
+        try {
+            this.#options.modelPreference?.set(model.currentValue);
+        }
+        catch {
+            this.#emit({
+                type: "diagnostic",
+                sessionId: session.sessionId,
+                code: "MODEL_PREFERENCE_WRITE_FAILED",
+                message: "The host could not persist the current model preference",
+            });
+        }
+    }
+    #readModelPreference() {
+        let value;
+        try {
+            value = this.#options.modelPreference?.get();
+        }
+        catch {
+            this.#emit({
+                type: "diagnostic",
+                code: "MODEL_PREFERENCE_READ_FAILED",
+                message: "The host model preference could not be read",
+            });
+            return undefined;
+        }
+        if (value === undefined)
+            return undefined;
+        if (validModelPreference(value))
+            return value;
+        this.#emit({
+            type: "diagnostic",
+            code: "INVALID_MODEL_PREFERENCE",
+            message: "Ignored an invalid host model preference",
+        });
+        return undefined;
     }
     #contextProvider(operation) {
         if (this.#destroyed)
@@ -1203,6 +1341,7 @@ class DefaultChatController {
         const session = this.#requireSession(turn.sessionId);
         if (session.activeTurn === turn)
             session.activeTurn = undefined;
+        session.timeline.finishTurn(stopReason === "cancelled" ? undefined : Date.now());
         session.phase = this.#driver?.promptReady(session.sessionId)
             ? "idle"
             : "cancelling";
@@ -1436,6 +1575,15 @@ function canonicalContentBase(value) {
         ...(annotations ? { annotations } : {}),
         ...(metadata ? { _meta: metadata } : {}),
     };
+}
+function findModelOption(options) {
+    return (options.find((option) => option.category === "model" && option.type === "select") ??
+        options.find((option) => option.id === "model" && option.type === "select"));
+}
+function validModelPreference(value) {
+    return (typeof value === "string" &&
+        value.length > 0 &&
+        utf8StringWithinBudget(value, MAX_MODEL_PREFERENCE_LENGTH));
 }
 function deduplicateSessions(sessions) {
     const seen = new Set();

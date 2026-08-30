@@ -1,4 +1,4 @@
-import type { AuthMethod, ChatActivity, ChatCommand, ChatConfigOption, ContentBlock, SessionPage, UsageInfo } from "../types.js";
+import type { AuthMethod, ChatActivity, ChatCommand, ChatConfigOption, ChatNoticeActivity, ContentBlock, SessionPage, UsageInfo } from "../types.js";
 export declare const MAX_CONTENT_TEXT: number;
 export declare const MAX_MEDIA_BASE64: number;
 export declare function isRecord(value: unknown): value is Record<string, unknown>;
@@ -21,13 +21,21 @@ export interface ReducerEffect {
     readonly sessionTitle?: string | null | undefined;
     readonly usage?: UsageInfo | undefined;
     readonly unsupported?: string | undefined;
+    readonly diagnostics?: readonly {
+        readonly code: string;
+        readonly message: string;
+    }[] | undefined;
 }
 export declare class TimelineStore {
     #private;
     get activities(): readonly ChatActivity[];
     reset(): void;
     beginTurn(): void;
-    addUserMessage(content: readonly ContentBlock[], pending: boolean): string;
+    addNotice(activity: ChatNoticeActivity): void;
+    addUserMessage(content: readonly ContentBlock[], pending: boolean, timestamp?: number): string;
+    markFinalAnswer(timestamp: number): void;
+    finishTurn(finalAnswerTimestamp?: number): void;
+    finalizeReplay(): ReducerEffect;
     markUserAccepted(contextItems?: readonly {
         readonly id: string;
         readonly label: string;

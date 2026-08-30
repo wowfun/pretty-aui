@@ -189,6 +189,13 @@ export interface ChatHost {
         readonly terminal?: TerminalHost;
     };
 }
+/** Optional host adapter for restoring the model used by new sessions. */
+export interface ModelPreferenceStore {
+    /** Returns the last bounded model value saved in the host's own scope. */
+    get(): string | undefined;
+    /** Saves the normalized model value of the currently selected session. */
+    set(value: string): void;
+}
 /** Framework-neutral construction options for a chat controller. */
 export interface ChatOptions {
     /** Factory that opens a fresh decoded transport for each attempt. */
@@ -199,6 +206,8 @@ export interface ChatOptions {
     readonly session: SessionOptions;
     /** Initial session action after connection. Defaults to a new session. */
     readonly initialSession?: InitialSession;
+    /** Best-effort host persistence for the model inherited by new sessions. */
+    readonly modelPreference?: ModelPreferenceStore;
     /** Fixed or per-turn context resolved before each prompt is sent. */
     readonly context?: readonly ContextItem[] | ContextProvider;
     /** Whether agent-advertised browser authentication may be used. */
@@ -218,6 +227,12 @@ export interface ChatMessage {
     readonly id: string;
     readonly role: MessageRole;
     readonly content: readonly ContentBlock[];
+    /**
+     * Reliable local event time in Unix epoch milliseconds. Present for a
+     * locally submitted user message or a live assistant answer when its turn
+     * completes; omitted when ACP history does not provide an original time.
+     */
+    readonly timestamp?: number | undefined;
     readonly pending?: boolean;
 }
 /** Bounded child-session semantics recognized from an agent task tool. */
@@ -271,7 +286,14 @@ export interface ChatContextActivity {
     readonly label: string;
     readonly content: readonly ContentBlock[];
 }
-export type ChatActivity = ChatMessage | ChatContextActivity | ChatToolCall | ChatPlan | ChatTerminal | UnsupportedActivity;
+/** Host-owned, controller-local transcript notice. */
+export interface ChatNoticeActivity {
+    readonly type: "notice";
+    readonly id: string;
+    readonly text: string;
+    readonly level: "info" | "error";
+}
+export type ChatActivity = ChatMessage | ChatContextActivity | ChatNoticeActivity | ChatToolCall | ChatPlan | ChatTerminal | UnsupportedActivity;
 export interface ChatConfigOption {
     readonly id: string;
     readonly name: string;
@@ -401,6 +423,13 @@ export interface ChatTurnHandle {
     readonly done: Promise<ChatTurnResult>;
 }
 export type ChatInput = string | ContentBlock | readonly ContentBlock[];
+/** Host notice with text bounded to 16 KiB in UTF-8 bytes. */
+export interface ChatNoticeInput {
+    readonly text: string;
+    readonly level: "info" | "error";
+    /** Non-empty when supplied; defaults to the selected session. */
+    readonly sessionId?: string | undefined;
+}
 export type PermissionDecision = {
     readonly outcome: "selected";
     readonly optionId: string;
@@ -464,6 +493,12 @@ export interface ChatController {
     getSnapshot(): ChatSnapshot;
     /** Subscribes to snapshot changes and returns an unsubscribe function. */
     subscribe(listener: () => void): () => void;
+    /**
+     * Appends a transient host notice to a loaded session. Returns false when
+     * the target record is unavailable or this controller has been destroyed;
+     * malformed input throws `INVALID_CONFIGURATION`.
+     */
+    appendNotice(input: ChatNoticeInput): boolean;
     /**
      * Starts one foreground turn and returns its completion handle. Foreseeable
      * input validation failures use `INVALID_CONFIGURATION`.

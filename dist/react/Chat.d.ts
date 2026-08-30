@@ -1,4 +1,4 @@
-import type { ChatProps, ChatRootProps } from "./types.js";
+import type { ChatLabels, ChatProps, ChatRootProps } from "./types.js";
 /**
  * Renders the normalized chat timeline and ACP interactions.
  *
@@ -16,4 +16,5 @@ export declare function ChatTranscript(): import("react").JSX.Element;
 export declare function ChatInteractions(): import("react").JSX.Element;
 /** Renders draft entry, commands, context, configuration, send, and cancel. */
 export declare function ChatComposer(): import("react").JSX.Element;
+export declare function formatSessionAge(value?: string, now?: number, format?: ChatLabels["sessionAge"]): string;
 //# sourceMappingURL=Chat.d.ts.map

@@ -1,0 +1,1 @@
+{"version":3,"file":"clipboard.d.ts","sourceRoot":"","sources":["../../src/react/clipboard.ts"],"names":[],"mappings":"AAIA,wBAAgB,eAAe,CAAC,IAAI,EAAE,MAAM,GAAG;IAC7C,QAAQ,CAAC,MAAM,EAAE,OAAO,CAAC;IACzB,QAAQ,CAAC,IAAI,EAAE,CAAC,KAAK,EAAE,WAAW,KAAK,IAAI,CAAC;CAC7C,CA4CA"}

@@ -191,7 +191,7 @@ test("bounds a long standalone session list to the fixed-height host", async ({
   const host = page.locator("#chat");
   const chat = host.locator(".pretty-aui");
   const newChat = chat.getByRole("button", { name: "New chat" });
-  for (let index = 0; index < 12; index += 1) {
+  for (let index = 0; index < 14; index += 1) {
     await newChat.click();
     await expect(newChat).toBeEnabled();
   }

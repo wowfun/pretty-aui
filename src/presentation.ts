@@ -21,9 +21,10 @@ export interface ChatLabels {
   readonly cancel: string;
   readonly changedFiles: string;
   readonly close: string;
-  readonly closeSession: string;
   readonly commands: string;
   readonly composerPlaceholder: string;
+  readonly copied: string;
+  readonly copy: string;
   readonly contextInjection: string;
   readonly contextSelection: string;
   readonly contextTruncated: (total: number) => string;
@@ -48,6 +49,11 @@ export interface ChatLabels {
   readonly resource: string;
   readonly scrollToLatest: string;
   readonly send: string;
+  readonly sessionAge: (
+    value: number,
+    unit: "now" | "minute" | "hour" | "day" | "month" | "year",
+  ) => string;
+  readonly sessionActions: (title: string) => string;
   readonly sessionPhase: (phase: string) => string;
   readonly sessionUntitled: string;
   readonly sessions: string;
@@ -55,7 +61,10 @@ export interface ChatLabels {
   readonly thinking: string;
   readonly terminalOutputInActivity: string;
   readonly tool: string;
+  readonly toolCollapseLines: string;
+  readonly toolExpandLines: (hidden: number) => string;
   readonly toolInput: string;
+  readonly toolNoOutput: string;
   readonly toolOutput: string;
   readonly toolResult: string;
   readonly unsupportedContent: (type: string) => string;
@@ -83,9 +92,10 @@ export const defaultLabels: ChatLabels = {
   cancel: "Cancel",
   changedFiles: "Changed files",
   close: "Close",
-  closeSession: "Close session",
   commands: "Commands",
   composerPlaceholder: "Ask anything…",
+  copied: "Copied",
+  copy: "Copy",
   contextInjection: "Context injection",
   contextSelection: "Context for next prompt",
   contextTruncated: (total) =>
@@ -112,6 +122,18 @@ export const defaultLabels: ChatLabels = {
   resource: "Resource",
   scrollToLatest: "Scroll to latest message",
   send: "Send",
+  sessionAge: (value, unit) => {
+    if (unit === "now") return "now";
+    const suffix = {
+      minute: "m",
+      hour: "h",
+      day: "d",
+      month: "mo",
+      year: "y",
+    }[unit];
+    return `${value}${suffix}`;
+  },
+  sessionActions: (title) => `Actions for ${title}`,
   sessionPhase: (phase) => titleCase(phase),
   sessionUntitled: "Untitled session",
   sessions: "Sessions",
@@ -119,7 +141,11 @@ export const defaultLabels: ChatLabels = {
   thinking: "Thinking",
   terminalOutputInActivity: "Terminal output is shown in the activity stream.",
   tool: "Tool",
+  toolCollapseLines: "Show less",
+  toolExpandLines: (hidden) =>
+    `... more ${hidden.toLocaleString()} ${hidden === 1 ? "line" : "lines"}`,
   toolInput: "Input",
+  toolNoOutput: "No output",
   toolOutput: "Output",
   toolResult: "tool result",
   unsupportedContent: (type) => `Unsupported agent content: ${type}`,

@@ -15,7 +15,9 @@ import {
   ChatInteractions,
   ChatRoot,
   ChatTranscript,
+  formatSessionAge,
 } from "../../src/react/Chat.js";
+import { formatMessageTimestamp } from "../../src/react/MessageActions.js";
 import type {
   ChatActivity,
   ChatSnapshot,
@@ -204,7 +206,7 @@ describe("Chat composition", () => {
     await waitFor(() => expect(loadMore).not.toBeDisabled());
   });
 
-  it("keeps loaded sessions discoverable with phase, interactions, and close actions", async () => {
+  it("keeps session state discoverable and exposes only supported delete actions", async () => {
     const controller = new FakeChatController({
       sessionId: "active",
       sessionTitle: "Active work",
@@ -243,39 +245,175 @@ describe("Chat composition", () => {
     });
     render(<Chat controller={controller} />);
     fireEvent.click(screen.getByRole("button", { name: "Sessions" }));
-    const background = screen
+    const dialog = screen.getByRole("dialog");
+    const active = within(dialog)
+      .getByText("Active work")
+      .closest(".paui-session")!;
+    const background = within(dialog)
       .getByText("Background review")
       .closest(".paui-session")!;
+    const closable = within(dialog)
+      .getByText("Closable work")
+      .closest(".paui-session")!;
 
-    expect(background).toHaveTextContent("Awaiting User");
-    expect(background).toHaveTextContent("2 pending interactions");
+    const activeSpinner = active.querySelector(".paui-session__spinner");
+    expect(activeSpinner).toBeVisible();
+    expect(activeSpinner).toHaveAttribute("aria-hidden", "true");
     expect(
-      within(background as HTMLElement).getByRole("button", {
-        name: "Close session",
+      background.querySelector(".paui-session__spinner"),
+    ).not.toBeInTheDocument();
+    expect(
+      closable.querySelector(".paui-session__spinner"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(background as HTMLElement).getByText("Awaiting User"),
+    ).toBeVisible();
+    expect(
+      within(background as HTMLElement).getByText("2 pending interactions"),
+    ).toBeVisible();
+    expect(
+      background.querySelector(".paui-session__meta-separator"),
+    ).toHaveTextContent("·");
+    expect(
+      within(active as HTMLElement).queryByRole("button", {
+        name: "Actions for Active work",
       }),
-    ).toBeDisabled();
-    fireEvent.click(
-      within(background as HTMLElement).getByRole("button", {
-        name: /Background review/,
-      }),
+    ).not.toBeInTheDocument();
+    expect(
+      within(dialog).queryByRole("button", { name: "Close session" }),
+    ).not.toBeInTheDocument();
+
+    const backgroundActions = within(background as HTMLElement).getByRole(
+      "button",
+      { name: "Actions for Background review" },
     );
-    expect(controller.openedSessions).toEqual(["background"]);
+    fireEvent.click(backgroundActions);
+    expect(controller.openedSessions).toEqual([]);
+    const disabledDelete = within(dialog).getByRole("menuitem", {
+      name: "Delete session",
+    });
+    expect(disabledDelete).toHaveAttribute("aria-disabled", "true");
+    await waitFor(() => expect(disabledDelete).toHaveFocus());
+    const outerEscape = vi.fn();
+    document.addEventListener("keydown", outerEscape);
+    fireEvent.keyDown(disabledDelete, { key: "Escape" });
+    document.removeEventListener("keydown", outerEscape);
+    expect(outerEscape).not.toHaveBeenCalled();
+    expect(within(dialog).queryByRole("menu")).not.toBeInTheDocument();
+    expect(backgroundActions).toHaveFocus();
+    expect(dialog).toBeInTheDocument();
+
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const closableActions = within(closable as HTMLElement).getByRole(
+      "button",
+      { name: "Actions for Closable work" },
+    );
+    fireEvent.click(closableActions);
+    const deleteItem = within(dialog).getByRole("menuitem", {
+      name: "Delete session",
+    });
+    expect(deleteItem).toHaveAttribute("aria-disabled", "false");
+    fireEvent.click(deleteItem);
+    expect(confirm).toHaveBeenCalledWith("Delete “Closable work”?");
+    expect(controller.deletedSessions).toEqual([]);
+    expect(closableActions).toHaveFocus();
+
+    confirm.mockReturnValue(true);
+    fireEvent.click(closableActions);
+    fireEvent.click(
+      within(dialog).getByRole("menuitem", { name: "Delete session" }),
+    );
     await waitFor(() =>
-      expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
+      expect(controller.deletedSessions).toEqual(["closable"]),
+    );
+    expect(controller.closedSessions).toEqual([]);
+    expect(within(dialog).queryByRole("menu")).not.toBeInTheDocument();
+    confirm.mockRestore();
+  });
+
+  it("keeps the drawer open and reports a session deletion failure", async () => {
+    const controller = new FakeChatController({
+      sessions: {
+        sessions: [{ sessionId: "older", title: "Older work" }],
+      },
+      capabilities: {
+        listSessions: true,
+        loadSession: true,
+        resumeSession: true,
+        closeSession: true,
+        deleteSession: true,
+      },
+    });
+    controller.deleteSessionError = new Error("Delete was rejected");
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    render(<Chat controller={controller} />);
+    fireEvent.click(screen.getByRole("button", { name: "Sessions" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Actions for Older work" }),
+    );
+    fireEvent.click(screen.getByRole("menuitem", { name: "Delete session" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Delete was rejected",
+    );
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(controller.deletedSessions).toEqual([]);
+    confirm.mockRestore();
+  });
+
+  it("formats compact relative session ages at bounded units", () => {
+    const now = new Date("2026-08-30T12:00:00Z").valueOf();
+    const ago = (milliseconds: number) =>
+      new Date(now - milliseconds).toISOString();
+    const minute = 60_000;
+    const hour = 60 * minute;
+    const day = 24 * hour;
+
+    expect(formatSessionAge(undefined, now)).toBe("");
+    expect(formatSessionAge("not-a-date", now)).toBe("not-a-date");
+    expect(formatSessionAge(new Date(now + day).toISOString(), now)).toBe(
+      "now",
+    );
+    expect(formatSessionAge(ago(minute - 1), now)).toBe("now");
+    expect(formatSessionAge(ago(5 * minute), now)).toBe("5m");
+    expect(formatSessionAge(ago(3 * hour), now)).toBe("3h");
+    expect(formatSessionAge(ago(2 * day), now)).toBe("2d");
+    expect(formatSessionAge(ago(60 * day), now)).toBe("2mo");
+    expect(formatSessionAge(ago(400 * day), now)).toBe("1y");
+  });
+
+  it("formats catalog session ages through the host labels", () => {
+    render(
+      <Chat
+        controller={
+          new FakeChatController({
+            sessions: {
+              sessions: [
+                {
+                  sessionId: "future-session",
+                  title: "Localized age",
+                  updatedAt: "2999-01-01T00:00:00.000Z",
+                },
+              ],
+            },
+            capabilities: {
+              listSessions: true,
+              loadSession: true,
+              resumeSession: true,
+              closeSession: false,
+              deleteSession: false,
+            },
+          })
+        }
+        labels={{
+          sessionAge: (value, unit) => `${unit}:${value}`,
+        }}
+      />,
     );
 
     fireEvent.click(screen.getByRole("button", { name: "Sessions" }));
-    const reopened = screen
-      .getByText("Closable work")
-      .closest(".paui-session")!;
-    fireEvent.click(
-      within(reopened as HTMLElement).getByRole("button", {
-        name: "Close session",
-      }),
-    );
-    await waitFor(() =>
-      expect(controller.closedSessions).toEqual(["closable"]),
-    );
+
+    expect(screen.getByText("now:0")).toBeInTheDocument();
   });
 
   it("allows a new session while the selected session is running", () => {
@@ -485,7 +623,9 @@ describe("Transcript", () => {
     ).toHaveLength(1);
     expect(view.container.querySelector("img[onerror]")).toBeNull();
     const user = screen.getByText("xss");
-    const tool = screen.getByText("Read project notes");
+    const tool = view.container.querySelector<HTMLElement>(
+      ".paui-tool .paui-flow-preview",
+    )!;
     const answer = screen.getByText("answer");
     expect(user.compareDocumentPosition(tool)).toBe(
       Node.DOCUMENT_POSITION_FOLLOWING,
@@ -495,6 +635,328 @@ describe("Transcript", () => {
     );
     view.unmount();
     await harness.close();
+  });
+
+  it("shows copy actions for users and only each settled turn's final answer", () => {
+    const controller = new FakeChatController({
+      activities: [
+        message("user", "first question", 1_000),
+        message("assistant", "intermediate answer"),
+        message("assistant", "first final answer", 2_000),
+        message("user", "second question", 3_000),
+        message("thought", "private reasoning"),
+        message("assistant", "second final answer", 4_000),
+      ],
+    });
+    render(<Chat controller={controller} />);
+
+    expect(screen.getAllByRole("button", { name: "Copy" })).toHaveLength(4);
+    expect(
+      within(
+        screen.getByText("intermediate answer").closest(".paui-message")!,
+      ).queryByRole("button", { name: "Copy" }),
+    ).toBeNull();
+    expect(
+      within(document.querySelector<HTMLElement>(".paui-thought")!).queryByRole(
+        "button",
+        { name: "Copy" },
+      ),
+    ).toBeNull();
+  });
+
+  it("withholds final-answer actions until the active turn settles", () => {
+    const controller = new FakeChatController({
+      phase: "running",
+      activities: [
+        message("user", "question", 1_000),
+        message("assistant", "streaming answer"),
+      ],
+    });
+    render(<Chat controller={controller} />);
+
+    expect(screen.getAllByRole("button", { name: "Copy" })).toHaveLength(1);
+
+    act(() => controller.setSnapshot({ phase: "idle" }));
+
+    expect(screen.getAllByRole("button", { name: "Copy" })).toHaveLength(2);
+  });
+
+  it("keeps a mid-turn host notice from finalizing a streaming answer", () => {
+    const controller = new FakeChatController({
+      phase: "running",
+      activities: [
+        message("user", "question", 1_000),
+        message("assistant", "answer before notice"),
+        {
+          type: "notice",
+          id: "host-notice",
+          text: "Still connected",
+          level: "info",
+        },
+        message("assistant", "answer after notice"),
+      ],
+    });
+    render(<Chat controller={controller} />);
+
+    expect(screen.getAllByRole("button", { name: "Copy" })).toHaveLength(1);
+
+    act(() => controller.setSnapshot({ phase: "idle" }));
+
+    expect(screen.getAllByRole("button", { name: "Copy" })).toHaveLength(2);
+    expect(
+      within(
+        screen.getByText("answer before notice").closest(".paui-message")!,
+      ).queryByRole("button", { name: "Copy" }),
+    ).toBeNull();
+    expect(
+      within(
+        screen.getByText("answer after notice").closest(".paui-message")!,
+      ).getByRole("button", { name: "Copy" }),
+    ).toBeInTheDocument();
+  });
+
+  it("places the user clock before copy and the answer clock after copy", () => {
+    const now = new Date(2026, 6, 29, 17, 30).getTime();
+    const { container } = render(
+      <Chat
+        controller={
+          new FakeChatController({
+            activities: [
+              message("user", "clock order", now),
+              message("assistant", "clock answer", now),
+            ],
+          })
+        }
+      />,
+    );
+    const rows = container.querySelectorAll<HTMLElement>(
+      '[data-pretty-aui-slot="message-actions"]',
+    );
+
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toHaveAttribute("data-clock", "start");
+    expect(rows[0]?.firstElementChild?.tagName).toBe("TIME");
+    expect(rows[0]?.lastElementChild?.tagName).toBe("BUTTON");
+    expect(rows[1]).toHaveAttribute("data-clock", "end");
+    expect(rows[1]?.firstElementChild?.tagName).toBe("BUTTON");
+    expect(rows[1]?.lastElementChild?.tagName).toBe("TIME");
+  });
+
+  it("copies only ordered text blocks and reports success for one second", async () => {
+    vi.useFakeTimers();
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    try {
+      render(
+        <Chat
+          controller={
+            new FakeChatController({
+              activities: [
+                {
+                  type: "message",
+                  id: "copy-source",
+                  role: "user",
+                  content: [
+                    { type: "text", text: "first" },
+                    {
+                      type: "resource_link",
+                      uri: "https://example.com",
+                      name: "ignored",
+                    },
+                    { type: "text", text: " second" },
+                  ],
+                  timestamp: Date.now(),
+                },
+              ],
+            })
+          }
+          labels={{ copy: "Duplicate", copied: "Done" }}
+        />,
+      );
+      const copy = screen.getByRole("button", { name: "Duplicate" });
+      fireEvent.click(copy);
+      fireEvent.click(copy);
+      expect(writeText).toHaveBeenCalledTimes(1);
+      expect(writeText).toHaveBeenCalledWith("first second");
+
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(screen.getByRole("button", { name: "Done" })).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Done" }));
+      expect(writeText).toHaveBeenCalledTimes(1);
+
+      act(() => vi.advanceTimersByTime(1_000));
+      expect(
+        screen.getByRole("button", { name: "Duplicate" }),
+      ).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: undefined,
+      });
+    }
+  });
+
+  it("falls back to execCommand and never claims a rejected clipboard write", async () => {
+    const originalExecCommand = Object.getOwnPropertyDescriptor(
+      document,
+      "execCommand",
+    );
+    let fallbackParent: ParentNode | null | undefined;
+    let fallbackRoot: Element | null | undefined;
+    const execute = vi.fn(() => {
+      const fallback = [
+        ...document.querySelectorAll<HTMLTextAreaElement>("textarea[readonly]"),
+      ].find((textarea) => textarea.style.left === "-9999px");
+      fallbackParent = fallback?.parentNode;
+      fallbackRoot = fallback?.closest(".pretty-aui");
+      return true;
+    });
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: undefined,
+    });
+    Object.defineProperty(document, "execCommand", {
+      configurable: true,
+      value: execute,
+    });
+    const fallback = render(
+      <Chat
+        controller={
+          new FakeChatController({ activities: [message("user", "fallback")] })
+        }
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+    expect(execute).toHaveBeenCalledWith("copy");
+    expect(fallbackParent).not.toBe(document.body);
+    expect(fallbackRoot).not.toBeNull();
+    fallback.unmount();
+
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: vi.fn().mockRejectedValue(new Error("denied")) },
+    });
+    render(
+      <Chat
+        controller={
+          new FakeChatController({ activities: [message("user", "rejected")] })
+        }
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByRole("button", { name: "Copy" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Copied" })).toBeNull();
+
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: undefined,
+    });
+    if (originalExecCommand) {
+      Object.defineProperty(document, "execCommand", originalExecCommand);
+    } else {
+      delete (document as unknown as { execCommand?: unknown }).execCommand;
+    }
+  });
+
+  it("cleans up pending copy feedback and the shared calendar timer", async () => {
+    vi.useFakeTimers();
+    let resolveWrite!: () => void;
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        writeText: vi.fn(
+          () =>
+            new Promise<void>((resolve) => {
+              resolveWrite = resolve;
+            }),
+        ),
+      },
+    });
+    try {
+      const view = render(
+        <Chat
+          controller={
+            new FakeChatController({ activities: [message("user", "pending")] })
+          }
+        />,
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+      view.unmount();
+      await act(async () => {
+        resolveWrite();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: undefined,
+      });
+    }
+  });
+
+  it("formats local message time across day and year boundaries", () => {
+    const now = new Date(2026, 6, 29, 10, 0).getTime();
+    expect(
+      formatMessageTimestamp(new Date(2026, 6, 29, 14, 24).getTime(), now),
+    ).toBe("14:24");
+    const sameYear = formatMessageTimestamp(
+      new Date(2026, 0, 1, 14, 24).getTime(),
+      now,
+    );
+    expect(sameYear).toMatch(/14:24$/);
+    expect(sameYear).not.toContain("2026");
+    const otherYear = formatMessageTimestamp(
+      new Date(2025, 11, 31, 9, 5).getTime(),
+      now,
+    );
+    expect(otherYear).toMatch(/09:05$/);
+    expect(otherYear).toContain("2025");
+  });
+
+  it("widens a same-day clock after local midnight", () => {
+    vi.useFakeTimers();
+    const beforeMidnight = new Date(2026, 6, 29, 23, 59, 59).getTime();
+    vi.setSystemTime(beforeMidnight);
+    try {
+      const { container } = render(
+        <Chat
+          controller={
+            new FakeChatController({
+              activities: [
+                message(
+                  "user",
+                  "midnight",
+                  new Date(2026, 6, 29, 14, 24).getTime(),
+                ),
+              ],
+            })
+          }
+        />,
+      );
+      const time = container.querySelector("time")!;
+      expect(time).toHaveTextContent("14:24");
+
+      act(() => vi.advanceTimersByTime(1_001));
+
+      expect(time.textContent).toMatch(/14:24$/);
+      expect(time.textContent).not.toBe("14:24");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("allows safe links and removes active unsafe URLs", () => {
@@ -653,6 +1115,69 @@ describe("Transcript", () => {
     expect(row.querySelector("a, img, audio")).toBeNull();
   });
 
+  it("renders consecutive host notices as one independent compact flow group", () => {
+    const controller = new FakeChatController({
+      phase: "running",
+      activities: [
+        message("user", "Run the evaluation"),
+        message("assistant", "Working"),
+        {
+          type: "notice",
+          id: "notice-info",
+          text: "Context attached",
+          level: "info",
+        },
+        {
+          type: "notice",
+          id: "notice-error",
+          text: "Background session failed",
+          level: "error",
+        },
+      ],
+    });
+    const { container } = render(<Chat controller={controller} />);
+    const groups = container.querySelectorAll(".paui-notice-group");
+    const rows = groups[0]!.querySelectorAll<HTMLElement>(
+      '[data-pretty-aui-slot="activity"][data-kind="notice"]',
+    );
+
+    expect(groups).toHaveLength(1);
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toHaveAttribute("data-level", "info");
+    expect(rows[1]).toHaveAttribute("data-level", "error");
+    expect(screen.getByRole("status")).toHaveTextContent("Context attached");
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Background session failed",
+    );
+    expect(groups[0]!.closest(".paui-turn")).toBeNull();
+    expect(groups[0]!.querySelector("button")).toBeNull();
+    expect(
+      container.querySelector(
+        '[data-pretty-aui-slot="message"][data-role="assistant"]',
+      ),
+    ).toHaveAttribute("aria-live", "polite");
+  });
+
+  it("keeps notice-only sessions in the hero composer layout", () => {
+    const controller = new FakeChatController({
+      activities: [
+        {
+          type: "notice",
+          id: "notice-only",
+          text: "Connected",
+          level: "info",
+        },
+      ],
+    });
+    const { container } = render(<Chat controller={controller} />);
+
+    expect(
+      container.querySelector('[data-pretty-aui-slot="composer"]'),
+    ).toHaveAttribute("data-placement", "hero");
+    expect(container.querySelector(".paui-empty")).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent("Connected");
+  });
+
   it("bounds context disclosure text without changing the activity", () => {
     const text = "x".repeat(20_001);
     const activity: ChatActivity = {
@@ -760,11 +1285,45 @@ describe("Transcript", () => {
       name: "Scroll to latest message",
     });
     expect(scroller).not.toContainElement(latest);
+    act(() => {
+      controller.setSnapshot({
+        activities: [
+          message("assistant", "one"),
+          {
+            type: "notice",
+            id: "notice-unpinned",
+            text: "Background update",
+            level: "info",
+          },
+        ],
+      });
+    });
+    expect(scroller.scrollTop).toBe(100);
     fireEvent.click(latest);
     expect(scroller.scrollTop).toBe(1_000);
 
     scroller.scrollTop = 580;
     fireEvent.scroll(scroller);
+    act(() => {
+      controller.setSnapshot({
+        activities: [
+          message("assistant", "one"),
+          {
+            type: "notice",
+            id: "notice-unpinned",
+            text: "Background update",
+            level: "info",
+          },
+          {
+            type: "notice",
+            id: "notice-pinned",
+            text: "Latest update",
+            level: "info",
+          },
+        ],
+      });
+    });
+    expect(scroller.scrollTop).toBe(1_000);
     expect(
       screen.queryByRole("button", { name: "Scroll to latest message" }),
     ).not.toBeInTheDocument();
@@ -891,6 +1450,280 @@ describe("Tool rendering seam", () => {
     expect(screen.getByText(/"query": "needle"/)).toBeInTheDocument();
     expect(screen.getByText("Output")).toBeInTheDocument();
     expect(screen.getByText(/"matches": 3/)).toBeInTheDocument();
+  });
+
+  it("renders Execute as a terminal card and copies only the original output", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    try {
+      const controller = new FakeChatController({
+        activities: [
+          {
+            type: "tool",
+            id: "execute-tool",
+            title: "Execute checks",
+            kind: "execute",
+            status: "completed",
+            content: [
+              {
+                type: "content",
+                content: {
+                  type: "text",
+                  text: "\u001b[32mone\u001b[0m\ntwo",
+                },
+              },
+            ],
+            locations: [],
+            rawInput: { command: "printf one\nprintf two", cwd: "/workspace" },
+          },
+        ],
+      });
+      const { container } = render(<Chat controller={controller} />);
+
+      fireEvent.click(screen.getByText("Execute checks"));
+      const card = container.querySelector('[data-tool-block="terminal"]')!;
+      expect(card).toHaveTextContent("/workspace");
+      expect(card).toHaveTextContent("printf one");
+      expect(card).toHaveTextContent("one");
+      fireEvent.click(
+        within(card as HTMLElement).getByRole("button", { name: "Copy" }),
+      );
+      expect(writeText).toHaveBeenCalledWith("\u001b[32mone\u001b[0m\ntwo");
+
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(
+        within(card as HTMLElement).getByRole("button", { name: "Copied" }),
+      ).toBeInTheDocument();
+
+      act(() => {
+        controller.setSnapshot({
+          activities: [
+            {
+              ...controller.getSnapshot().activities[0]!,
+              type: "tool",
+              content: [
+                {
+                  type: "content",
+                  content: { type: "text", text: "replacement" },
+                },
+              ],
+            } as ChatToolCall,
+          ],
+        });
+      });
+      expect(screen.getByRole("button", { name: "Copy" })).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Copied" })).toBeNull();
+    } finally {
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: undefined,
+      });
+    }
+  });
+
+  it("keeps a running Execute card to its command banner", () => {
+    const { container } = render(
+      <Chat
+        controller={
+          new FakeChatController({
+            activities: [
+              {
+                type: "tool",
+                id: "running-execute",
+                title: "Execute build",
+                kind: "execute",
+                status: "in_progress",
+                content: [],
+                locations: [],
+                rawInput: { command: "pnpm build", cwd: "/workspace" },
+              },
+            ],
+          })
+        }
+      />,
+    );
+
+    fireEvent.click(screen.getByText("Execute build"));
+    const card = container.querySelector('[data-tool-block="terminal"]')!;
+    expect(card).toHaveAttribute("data-state", "running");
+    expect(card).toHaveTextContent("pnpm build");
+    expect(
+      within(card as HTMLElement).queryByRole("button", { name: "Copy" }),
+    ).toBeNull();
+    expect(within(card as HTMLElement).queryByText("No output")).toBeNull();
+  });
+
+  it("folds a long Read window while copying the full body without line numbers", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    const body = Array.from(
+      { length: 10 },
+      (_, index) => `line ${index + 1}`,
+    ).join("\n");
+    try {
+      const { container } = render(
+        <Chat
+          controller={
+            new FakeChatController({
+              activities: [
+                {
+                  type: "tool",
+                  id: "read-tool",
+                  title: "Read LICENSE",
+                  kind: "read",
+                  status: "completed",
+                  content: [],
+                  locations: [{ path: "/workspace/LICENSE" }],
+                  rawInput: { filePath: "/workspace/LICENSE", offset: 11 },
+                  rawOutput: {
+                    metadata: { display: { type: "file", text: body } },
+                  },
+                },
+              ],
+            })
+          }
+        />,
+      );
+
+      fireEvent.click(container.querySelector("summary")!);
+      const card = container.querySelector('[data-tool-block="read"]')!;
+      expect(within(card as HTMLElement).queryByText("line 5")).toBeNull();
+      const expand = within(card as HTMLElement).getByRole("button", {
+        name: "... more 2 lines",
+      });
+      expect(expand).toHaveAttribute("aria-expanded", "false");
+      fireEvent.click(expand);
+      expect(
+        within(card as HTMLElement).getByText("line 5"),
+      ).toBeInTheDocument();
+      expect(
+        within(card as HTMLElement).getByRole("button", { name: "Show less" }),
+      ).toHaveAttribute("aria-expanded", "true");
+
+      fireEvent.click(
+        within(card as HTMLElement).getByRole("button", { name: "Copy" }),
+      );
+      expect(writeText).toHaveBeenCalledWith(body);
+    } finally {
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: undefined,
+      });
+    }
+  });
+
+  it("renders ACP Diff statistics and copies its full patch", () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    const patch = "--- a/a.ts\n+++ b/a.ts\n-old\n+new";
+    try {
+      const { container } = render(
+        <Chat
+          controller={
+            new FakeChatController({
+              activities: [
+                {
+                  type: "tool",
+                  id: "diff-tool",
+                  title: "Edit a.ts",
+                  kind: "edit",
+                  status: "completed",
+                  content: [
+                    {
+                      type: "diff",
+                      changes: [{ operation: "modify", path: "a.ts" }],
+                      patch,
+                    },
+                  ],
+                  locations: [{ path: "a.ts" }],
+                },
+              ],
+            })
+          }
+        />,
+      );
+
+      fireEvent.click(screen.getByText("Edit a.ts"));
+      const card = container.querySelector('[data-tool-block="diff"]')!;
+      expect(card).toHaveTextContent("+1 −1 · 1 Changed files");
+      expect(card.querySelectorAll('[data-line-kind="add"]')).toHaveLength(1);
+      expect(card.querySelectorAll('[data-line-kind="delete"]')).toHaveLength(
+        1,
+      );
+      fireEvent.click(
+        within(card as HTMLElement).getByRole("button", { name: "Copy" }),
+      );
+      expect(writeText).toHaveBeenCalledWith(patch);
+    } finally {
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: undefined,
+      });
+    }
+  });
+
+  it("gives generic IN and OUT sections independent semantic copies", () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    try {
+      const { container } = render(
+        <Chat
+          controller={
+            new FakeChatController({
+              activities: [
+                {
+                  type: "tool",
+                  id: "io-tool",
+                  title: "Search",
+                  kind: "search",
+                  status: "completed",
+                  content: [
+                    {
+                      type: "content",
+                      content: { type: "text", text: "three matches" },
+                    },
+                  ],
+                  locations: [],
+                  rawInput: { query: "needle" },
+                },
+              ],
+            })
+          }
+        />,
+      );
+
+      fireEvent.click(container.querySelector("summary")!);
+      const card = container.querySelector('[data-tool-block="io"]')!;
+      const sections = card.querySelectorAll<HTMLElement>("section");
+      fireEvent.click(
+        within(sections[0]!).getByRole("button", { name: "Copy" }),
+      );
+      fireEvent.click(
+        within(sections[1]!).getByRole("button", { name: "Copy" }),
+      );
+      expect(writeText).toHaveBeenNthCalledWith(1, '{\n  "query": "needle"\n}');
+      expect(writeText).toHaveBeenNthCalledWith(2, "three matches");
+    } finally {
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: undefined,
+      });
+    }
   });
 
   it("uses the built-in body when a custom renderer returns undefined", () => {
@@ -1491,10 +2324,47 @@ describe("Composer", () => {
     fireEvent.input(composer, { target: { value: "/rev" } });
     fireEvent.click(screen.getByRole("option", { name: /\/review/ }));
     expect(composer).toHaveValue("/review ");
-    fireEvent.change(screen.getByLabelText("Model"), {
-      target: { value: "fast" },
-    });
+    const model = screen.getByRole("combobox", { name: "Model" });
+    fireEvent.click(model);
+    fireEvent.click(screen.getByRole("option", { name: "Fast" }));
     expect(controller.configChanges).toEqual([{ id: "model", value: "fast" }]);
+  });
+
+  it("keeps focus on package-owned configuration listboxes", () => {
+    const controller = new FakeChatController({
+      configOptions: [
+        {
+          id: "model",
+          name: "Model",
+          type: "select",
+          currentValue: "balanced",
+          options: [
+            { value: "fast", name: "Fast" },
+            { value: "balanced", name: "Balanced" },
+          ],
+        },
+      ],
+    });
+    render(<Chat controller={controller} />);
+    const model = screen.getByRole("combobox", { name: "Model" });
+    model.focus();
+
+    fireEvent.keyDown(model, { key: "ArrowUp" });
+    expect(model).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("option", { name: "Fast" })).toHaveAttribute(
+      "data-active",
+      "true",
+    );
+    expect(document.activeElement).toBe(model);
+
+    fireEvent.keyDown(model, { key: "Escape" });
+    expect(screen.queryByRole("listbox", { name: "Model" })).toBeNull();
+    expect(document.activeElement).toBe(model);
+
+    fireEvent.keyDown(model, { key: "ArrowUp" });
+    fireEvent.keyDown(model, { key: "Enter" });
+    expect(controller.configChanges).toEqual([{ id: "model", value: "fast" }]);
+    expect(document.activeElement).toBe(model);
   });
 
   it("navigates and dismisses command suggestions from the keyboard", () => {
@@ -1552,12 +2422,14 @@ describe("Composer", () => {
 function message(
   role: "user" | "assistant" | "thought",
   text: string,
+  timestamp?: number,
 ): Extract<ChatActivity, { type: "message" }> {
   return {
     type: "message",
     id: `${role}-${text}`,
     role,
     content: [{ type: "text", text }],
+    ...(timestamp !== undefined ? { timestamp } : {}),
   };
 }
 

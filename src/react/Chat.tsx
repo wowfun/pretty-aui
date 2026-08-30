@@ -22,6 +22,8 @@ import type {
   ChatActivity,
   ChatContextActivity,
   ChatController,
+  ChatConfigOption,
+  ChatNoticeActivity,
   ChatOptions,
   ChatSnapshot,
   ChatToolCall,
@@ -37,6 +39,9 @@ import type {
   ChatRootProps,
   ToolActivityRenderer,
 } from "./types.js";
+import { MessageActions } from "./MessageActions.js";
+import { BuiltInToolBody } from "./ToolBlocks.js";
+import { formatToolValue } from "./tool-block-model.js";
 
 interface ChatContextValue {
   readonly controller: ChatController;
@@ -84,6 +89,7 @@ const CONNECTING_CONTROLLER: ChatController = {
   ready: new Promise<void>(() => undefined),
   getSnapshot: () => CONNECTING_SNAPSHOT,
   subscribe: () => () => undefined,
+  appendNotice: () => false,
   send() {
     throw new Error("The chat session is still connecting");
   },
@@ -464,6 +470,15 @@ export function ChatTranscript() {
     () => groupActivities(snapshot.activities),
     [snapshot.activities],
   );
+  const turnActive =
+    snapshot.phase === "running" ||
+    snapshot.phase === "awaiting_user" ||
+    snapshot.phase === "cancelling";
+  const activeGroupIndex = turnActive ? lastTurnGroupIndex(groups) : -1;
+  const completedAnswerIds = useMemo(
+    () => settledAssistantMessageIds(snapshot.activities, turnActive),
+    [snapshot.activities, turnActive],
+  );
   return (
     <>
       <main
@@ -490,20 +505,20 @@ export function ChatTranscript() {
               <p>{labels.emptyDescription}</p>
             </div>
           ) : null}
-          {groups.map((group, index) => (
-            <TurnGroup
-              key={group.id}
-              group={group}
-              labels={labels}
-              toolActivityRenderer={toolActivityRenderer}
-              active={
-                index === groups.length - 1 &&
-                (snapshot.phase === "running" ||
-                  snapshot.phase === "awaiting_user" ||
-                  snapshot.phase === "cancelling")
-              }
-            />
-          ))}
+          {groups.map((group, index) =>
+            group.kind === "notice" ? (
+              <NoticeGroup group={group} labels={labels} key={group.id} />
+            ) : (
+              <TurnGroup
+                key={group.id}
+                group={group}
+                labels={labels}
+                toolActivityRenderer={toolActivityRenderer}
+                active={index === activeGroupIndex}
+                completedAnswerIds={completedAnswerIds}
+              />
+            ),
+          )}
         </div>
       </main>
       {!pinned ? (
@@ -590,38 +605,92 @@ export function ChatInteractions() {
   );
 }
 
-interface ActivityGroup {
+interface TurnActivityGroup {
+  readonly kind: "turn";
   readonly id: string;
   readonly user?: Extract<ChatActivity, { type: "message" }>;
   readonly activities: readonly ChatActivity[];
 }
 
+interface NoticeActivityGroup {
+  readonly kind: "notice";
+  readonly id: string;
+  readonly activities: readonly ChatNoticeActivity[];
+}
+
+type ActivityGroup = TurnActivityGroup | NoticeActivityGroup;
+
+function lastTurnGroupIndex(groups: readonly ActivityGroup[]): number {
+  for (let index = groups.length - 1; index >= 0; index -= 1) {
+    if (groups[index]?.kind === "turn") return index;
+  }
+  return -1;
+}
+
 function groupActivities(activities: readonly ChatActivity[]): ActivityGroup[] {
   const groups: ActivityGroup[] = [];
-  let id = "opening";
-  let user: Extract<ChatActivity, { type: "message" }> | undefined;
-  let groupedActivities: ChatActivity[] = [];
-  const flush = () => {
-    if (user || groupedActivities.length) {
-      groups.push({
-        id,
-        ...(user ? { user } : {}),
-        activities: groupedActivities,
-      });
-    }
+  let turn:
+    | {
+        id: string;
+        user?: Extract<ChatActivity, { type: "message" }>;
+        activities: ChatActivity[];
+      }
+    | undefined;
+  const flushTurn = () => {
+    if (!turn) return;
+    groups.push({ kind: "turn", ...turn });
+    turn = undefined;
   };
   for (const activity of activities) {
+    if (activity.type === "notice") {
+      flushTurn();
+      const previous = groups.at(-1);
+      if (previous?.kind === "notice") {
+        groups[groups.length - 1] = {
+          ...previous,
+          activities: [...previous.activities, activity],
+        };
+      } else {
+        groups.push({
+          kind: "notice",
+          id: activity.id,
+          activities: [activity],
+        });
+      }
+      continue;
+    }
     if (activity.type === "message" && activity.role === "user") {
-      flush();
-      id = activity.id;
-      user = activity;
-      groupedActivities = [];
+      flushTurn();
+      turn = { id: activity.id, user: activity, activities: [] };
     } else {
-      groupedActivities.push(activity);
+      turn ??= { id: activity.id, activities: [] };
+      turn.activities.push(activity);
     }
   }
-  flush();
+  flushTurn();
   return groups;
+}
+
+function NoticeGroup({
+  group,
+  labels,
+}: {
+  group: NoticeActivityGroup;
+  labels: ChatLabels;
+}) {
+  return (
+    <div className="paui-notice-group">
+      {group.activities.map((activity) => (
+        <ActivityRow
+          activity={activity}
+          labels={labels}
+          running={false}
+          showMessageActions={false}
+          key={activity.id}
+        />
+      ))}
+    </div>
+  );
 }
 
 function TurnGroup({
@@ -629,15 +698,19 @@ function TurnGroup({
   labels,
   toolActivityRenderer,
   active,
+  completedAnswerIds,
 }: {
-  group: ActivityGroup;
+  group: TurnActivityGroup;
   labels: ChatLabels;
   toolActivityRenderer?: ToolActivityRenderer | undefined;
   active: boolean;
+  completedAnswerIds: ReadonlySet<string>;
 }) {
   return (
     <article className="paui-turn">
-      {group.user ? <MessageView message={group.user} labels={labels} /> : null}
+      {group.user ? (
+        <MessageView message={group.user} labels={labels} showActions />
+      ) : null}
       {group.activities.length ? (
         <div className="paui-activities">
           {group.activities.map((activity, index) => (
@@ -646,6 +719,7 @@ function TurnGroup({
               labels={labels}
               toolActivityRenderer={toolActivityRenderer}
               running={active && index === group.activities.length - 1}
+              showMessageActions={completedAnswerIds.has(activity.id)}
               key={activity.id}
             />
           ))}
@@ -660,11 +734,13 @@ const ActivityRow = memo(function ActivityRow({
   labels,
   toolActivityRenderer,
   running,
+  showMessageActions,
 }: {
   activity: ChatActivity;
   labels: ChatLabels;
   toolActivityRenderer?: ToolActivityRenderer | undefined;
   running: boolean;
+  showMessageActions: boolean;
 }) {
   return (
     <div
@@ -677,6 +753,7 @@ const ActivityRow = memo(function ActivityRow({
             ? "subagent"
             : activity.type
       }
+      data-level={activity.type === "notice" ? activity.level : undefined}
       data-status={activityStatus(activity)}
     >
       <ActivityView
@@ -684,6 +761,7 @@ const ActivityRow = memo(function ActivityRow({
         labels={labels}
         toolActivityRenderer={toolActivityRenderer}
         running={running}
+        showMessageActions={showMessageActions}
       />
     </div>
   );
@@ -694,19 +772,38 @@ function ActivityView({
   labels,
   toolActivityRenderer,
   running,
+  showMessageActions,
 }: {
   activity: ChatActivity;
   labels: ChatLabels;
   toolActivityRenderer?: ToolActivityRenderer | undefined;
   running: boolean;
+  showMessageActions: boolean;
 }) {
   switch (activity.type) {
     case "message":
       return (
-        <MessageView message={activity} labels={labels} running={running} />
+        <MessageView
+          message={activity}
+          labels={labels}
+          running={running}
+          showActions={showMessageActions}
+        />
       );
     case "context":
       return <ContextActivity activity={activity} labels={labels} />;
+    case "notice":
+      return (
+        <div
+          className="paui-host-notice"
+          role={activity.level === "error" ? "alert" : "status"}
+        >
+          <span className="paui-host-notice__icon" aria-hidden="true">
+            {activity.level === "error" ? <WarningIcon /> : <InfoIcon />}
+          </span>
+          <span>{activity.text}</span>
+        </div>
+      );
     case "tool":
       if (activity.subagent) {
         return (
@@ -871,9 +968,7 @@ function ContextBlockView({
       </span>
     );
   }
-  return (
-    <ContextLiteralText text={formatRawToolValue(block)} labels={labels} />
-  );
+  return <ContextLiteralText text={formatToolValue(block)} labels={labels} />;
 }
 
 function ContextLiteralText({
@@ -1019,10 +1114,12 @@ function MessageView({
   message,
   labels,
   running = false,
+  showActions = false,
 }: {
   message: Extract<ChatActivity, { type: "message" }>;
   labels: ChatLabels;
   running?: boolean | undefined;
+  showActions?: boolean | undefined;
 }) {
   if (message.role === "thought") {
     return (
@@ -1035,21 +1132,60 @@ function MessageView({
       data-pretty-aui-slot="message"
       data-role={message.role}
       data-pending={message.pending || undefined}
+      data-time-hover-root={showActions || undefined}
       aria-live={message.role === "assistant" && running ? "polite" : undefined}
       aria-atomic={
         message.role === "assistant" && running ? "false" : undefined
       }
     >
-      <span className="paui-message__label">
-        {message.role === "user" ? labels.you : labels.assistantName}
-      </span>
-      <div className="paui-message__content">
-        {message.content.map((block, index) => (
-          <ContentView block={block} labels={labels} key={index} />
-        ))}
+      <div className="paui-message__bubble">
+        <span className="paui-message__label">
+          {message.role === "user" ? labels.you : labels.assistantName}
+        </span>
+        <div className="paui-message__content">
+          {message.content.map((block, index) => (
+            <ContentView block={block} labels={labels} key={index} />
+          ))}
+        </div>
       </div>
+      {showActions ? (
+        <MessageActions
+          content={message.content}
+          timestamp={message.timestamp}
+          clock={message.role === "user" ? "start" : "end"}
+          labels={labels}
+        />
+      ) : null}
     </div>
   );
+}
+
+function settledAssistantMessageIds(
+  activities: readonly ChatActivity[],
+  active: boolean,
+): ReadonlySet<string> {
+  const settled = new Set<string>();
+  let hasTurnActivity = false;
+  let lastAssistantId: string | undefined;
+  const settleTurn = () => {
+    if (lastAssistantId) settled.add(lastAssistantId);
+    hasTurnActivity = false;
+    lastAssistantId = undefined;
+  };
+  for (const activity of activities) {
+    if (activity.type === "notice") continue;
+    if (activity.type === "message" && activity.role === "user") {
+      if (hasTurnActivity) settleTurn();
+      hasTurnActivity = true;
+      continue;
+    }
+    hasTurnActivity = true;
+    if (activity.type === "message" && activity.role === "assistant") {
+      lastAssistantId = activity.id;
+    }
+  }
+  if (!active && hasTurnActivity) settleTurn();
+  return settled;
 }
 
 function ThoughtDisclosure({
@@ -1204,29 +1340,14 @@ function DefaultToolBody({
   tool: ChatToolCall;
   labels: ChatLabels;
 }) {
-  if (tool.content.length) {
-    return tool.content.map((content, index) => (
-      <ToolContentView key={index} value={content} labels={labels} />
-    ));
-  }
-  if (tool.rawInput === undefined && tool.rawOutput === undefined) {
-    return <span className="paui-muted">{labels.tool}</span>;
-  }
   return (
-    <div className="paui-tool-raw">
-      {tool.rawInput !== undefined ? (
-        <section>
-          <strong>{labels.toolInput}</strong>
-          <pre>{formatRawToolValue(tool.rawInput)}</pre>
-        </section>
-      ) : null}
-      {tool.rawOutput !== undefined ? (
-        <section>
-          <strong>{labels.toolOutput}</strong>
-          <pre>{formatRawToolValue(tool.rawOutput)}</pre>
-        </section>
-      ) : null}
-    </div>
+    <BuiltInToolBody
+      tool={tool}
+      labels={labels}
+      renderContent={(value, key) => (
+        <ToolContentView key={key} value={value} labels={labels} />
+      )}
+    />
   );
 }
 
@@ -1445,7 +1566,7 @@ export function ChatComposer() {
   const sessionRef = useRef(sessionKey);
   const draftsRef = useRef(new Map<string | undefined, string>());
   const placement =
-    snapshot.activities.length ||
+    snapshot.activities.some((activity) => activity.type !== "notice") ||
     snapshot.interactions.length ||
     snapshot.phase === "auth_required" ||
     snapshot.error
@@ -1728,25 +1849,173 @@ function ConfigBar({
             <span>{option.name}</span>
           </label>
         ) : option.type === "select" ? (
-          <label key={option.id} title={option.description}>
-            <span className="paui-sr-only">{option.name}</span>
-            <select
-              value={String(option.currentValue)}
-              onChange={(event) =>
-                runAction(() =>
-                  controller.setConfigOption(option.id, event.target.value),
-                )
-              }
-            >
-              {option.options?.map((choice) => (
-                <option value={choice.value} key={choice.value}>
-                  {choice.name}
-                </option>
-              ))}
-            </select>
-          </label>
+          <ConfigSelect
+            controller={controller}
+            option={option}
+            key={option.id}
+          />
         ) : null,
       )}
+    </div>
+  );
+}
+
+function ConfigSelect({
+  controller,
+  option,
+}: {
+  controller: ChatController;
+  option: ChatConfigOption;
+}) {
+  const { runAction } = useChatContext("ChatComposer");
+  const rootRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const listboxRef = useRef<HTMLDivElement>(null);
+  const id = useId().replaceAll(":", "");
+  const listboxId = `paui-config-${id}`;
+  const choices = option.options ?? [];
+  const selectedIndex = choices.findIndex(
+    (choice) => choice.value === String(option.currentValue),
+  );
+  const selected = selectedIndex >= 0 ? choices[selectedIndex] : undefined;
+  const [open, setOpen] = useState(false);
+  const [activeIndex, setActiveIndex] = useState(Math.max(0, selectedIndex));
+
+  const openList = (index = Math.max(0, selectedIndex)) => {
+    if (!choices.length) return;
+    setActiveIndex(index);
+    setOpen(true);
+  };
+  const closeList = (restoreFocus = false) => {
+    setOpen(false);
+    if (restoreFocus) triggerRef.current?.focus();
+  };
+  const choose = (index: number) => {
+    const choice = choices[index];
+    if (!choice) return;
+    closeList(true);
+    if (choice.value !== String(option.currentValue)) {
+      runAction(() => controller.setConfigOption(option.id, choice.value));
+    }
+  };
+  const move = (delta: number) => {
+    if (!choices.length) return;
+    setActiveIndex(
+      (index) => (index + delta + choices.length) % choices.length,
+    );
+  };
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (event: PointerEvent) => {
+      if (rootRef.current && event.composedPath().includes(rootRef.current)) {
+        return;
+      }
+      setOpen(false);
+    };
+    window.addEventListener("pointerdown", onPointerDown, true);
+    return () => window.removeEventListener("pointerdown", onPointerDown, true);
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    const activeOption = listboxRef.current?.querySelector<HTMLElement>(
+      `#${listboxId}-option-${activeIndex}`,
+    );
+    activeOption?.scrollIntoView?.({ block: "nearest" });
+  }, [activeIndex, listboxId, open]);
+
+  const onKeyDown = (event: KeyboardEvent<HTMLButtonElement>) => {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      const delta = event.key === "ArrowDown" ? 1 : -1;
+      if (!open) {
+        const start = selectedIndex >= 0 ? selectedIndex : 0;
+        openList((start + delta + choices.length) % choices.length);
+      } else move(delta);
+      return;
+    }
+    if (event.key === "Home" && open) {
+      event.preventDefault();
+      setActiveIndex(0);
+      return;
+    }
+    if (event.key === "End" && open) {
+      event.preventDefault();
+      setActiveIndex(Math.max(0, choices.length - 1));
+      return;
+    }
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      if (open) choose(activeIndex);
+      else openList();
+      return;
+    }
+    if (event.key === "Escape" && open) {
+      event.preventDefault();
+      closeList(true);
+      return;
+    }
+    if (event.key === "Tab") closeList();
+  };
+
+  return (
+    <div className="paui-config__field" ref={rootRef}>
+      <button
+        ref={triggerRef}
+        className="paui-config__trigger"
+        type="button"
+        role="combobox"
+        aria-label={option.name}
+        aria-controls={open ? listboxId : undefined}
+        aria-expanded={open}
+        aria-haspopup="listbox"
+        aria-activedescendant={
+          open ? `${listboxId}-option-${activeIndex}` : undefined
+        }
+        title={option.description}
+        disabled={!choices.length}
+        onClick={() => (open ? closeList() : openList())}
+        onKeyDown={onKeyDown}
+      >
+        <span>{selected?.name ?? String(option.currentValue)}</span>
+        <ChevronIcon />
+      </button>
+      {open ? (
+        <div
+          ref={listboxRef}
+          className="paui-config__listbox"
+          id={listboxId}
+          role="listbox"
+          aria-label={option.name}
+        >
+          {choices.map((choice, index) => (
+            <button
+              id={`${listboxId}-option-${index}`}
+              className="paui-config__option"
+              type="button"
+              role="option"
+              aria-selected={choice.value === String(option.currentValue)}
+              data-active={index === activeIndex || undefined}
+              title={choice.description}
+              tabIndex={-1}
+              key={choice.value}
+              onMouseMove={
+                index === activeIndex ? undefined : () => setActiveIndex(index)
+              }
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={() => choose(index)}
+            >
+              <span>{choice.name}</span>
+              <span className="paui-config__check" aria-hidden="true">
+                {choice.value === String(option.currentValue) ? (
+                  <ConfigCheckIcon />
+                ) : null}
+              </span>
+            </button>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -2066,9 +2335,32 @@ function SessionDrawer({
   const { ids } = useChatContext("ChatHeader");
   const closeRef = useRef<HTMLButtonElement>(null);
   const dialogRef = useRef<HTMLElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const menuItemRef = useRef<HTMLButtonElement>(null);
+  const menuTriggerRef = useRef<HTMLButtonElement | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>();
+  const [menuSessionId, setMenuSessionId] = useState<string>();
+  const [menuPosition, setMenuPosition] = useState<{
+    readonly left: number;
+    readonly top: number;
+  }>();
   const sessions = mergeDrawerSessions(snapshot);
+  const menuSession = sessions.find(
+    (session) => session.sessionId === menuSessionId,
+  );
+  const drawerNow = Date.now();
+  const menuDeleteDisabled =
+    loading ||
+    menuSession?.loaded?.phase === "running" ||
+    menuSession?.loaded?.phase === "cancelling" ||
+    (menuSession?.loaded?.interactionCount ?? 0) > 0;
+  const closeMenu = useCallback((restoreFocus = false) => {
+    const trigger = menuTriggerRef.current;
+    setMenuSessionId(undefined);
+    setMenuPosition(undefined);
+    if (restoreFocus && trigger?.isConnected) trigger.focus();
+  }, []);
   useEffect(() => {
     const activeElement = activeElementFor(dialogRef.current);
     const previousFocus =
@@ -2089,10 +2381,69 @@ function SessionDrawer({
         .finally(() => setLoading(false));
     }
   }, [controller, snapshot.capabilities.listSessions, snapshot.sessions]);
+  useLayoutEffect(() => {
+    if (!menuSessionId) return;
+    const drawer = dialogRef.current;
+    const menu = menuRef.current;
+    const trigger = menuTriggerRef.current;
+    if (!drawer || !menu || !trigger) return;
+    const drawerRect = drawer.getBoundingClientRect();
+    const menuRect = menu.getBoundingClientRect();
+    const triggerRect = trigger.getBoundingClientRect();
+    const margin = 8;
+    const gap = 4;
+    const maxLeft = Math.max(
+      margin,
+      drawerRect.width - menuRect.width - margin,
+    );
+    const left = Math.min(
+      Math.max(triggerRect.right - drawerRect.left - menuRect.width, margin),
+      maxLeft,
+    );
+    const below = triggerRect.bottom - drawerRect.top + gap;
+    const above = triggerRect.top - drawerRect.top - menuRect.height - gap;
+    const preferredTop =
+      below + menuRect.height <= drawerRect.height - margin ? below : above;
+    const maxTop = Math.max(
+      margin,
+      drawerRect.height - menuRect.height - margin,
+    );
+    const top = Math.min(Math.max(preferredTop, margin), maxTop);
+    setMenuPosition({ left, top });
+  }, [menuSessionId]);
+  useLayoutEffect(() => {
+    if (menuSessionId && menuPosition) menuItemRef.current?.focus();
+  }, [menuPosition, menuSessionId]);
+  useEffect(() => {
+    if (!menuSessionId) return;
+    const onPointerDown = (event: PointerEvent) => {
+      const path = event.composedPath();
+      if (
+        (menuRef.current && path.includes(menuRef.current)) ||
+        (menuTriggerRef.current && path.includes(menuTriggerRef.current))
+      )
+        return;
+      closeMenu();
+    };
+    const onGeometryChange = () => closeMenu();
+    window.addEventListener("pointerdown", onPointerDown, true);
+    window.addEventListener("scroll", onGeometryChange, true);
+    window.addEventListener("resize", onGeometryChange);
+    return () => {
+      window.removeEventListener("pointerdown", onPointerDown, true);
+      window.removeEventListener("scroll", onGeometryChange, true);
+      window.removeEventListener("resize", onGeometryChange);
+    };
+  }, [closeMenu, menuSessionId]);
   useEffect(() => {
     const onKey = (event: globalThis.KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
+        if (menuSessionId) {
+          event.stopPropagation();
+          closeMenu(true);
+          return;
+        }
         onClose();
         return;
       }
@@ -2122,9 +2473,9 @@ function SessionDrawer({
         first.focus();
       }
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [closeMenu, menuSessionId, onClose]);
   const select = async (sessionId: string) => {
     setLoading(true);
     setError(undefined);
@@ -2148,11 +2499,17 @@ function SessionDrawer({
       setLoading(false);
     }
   };
-  const closeSession = async (sessionId: string) => {
+  const deleteSession = async (session: DrawerSession) => {
+    const title = session.title ?? labels.sessionUntitled;
+    if (!window.confirm(labels.confirmDeleteSession(title))) {
+      closeMenu(true);
+      return;
+    }
+    closeMenu();
     setLoading(true);
     setError(undefined);
     try {
-      await controller.closeSession(sessionId);
+      await controller.deleteSession(session.sessionId);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -2193,80 +2550,91 @@ function SessionDrawer({
           {!loading && !sessions.length ? (
             <span className="paui-muted">{labels.noSessions}</span>
           ) : null}
-          {sessions.map((session) => (
-            <div
-              className="paui-session"
-              data-active={
-                session.sessionId === snapshot.sessionId || undefined
-              }
-              key={session.sessionId}
-            >
-              <button
-                type="button"
-                disabled={loading || session.sessionId === snapshot.sessionId}
-                onClick={() => void select(session.sessionId)}
+          {sessions.map((session) => {
+            const active = session.sessionId === snapshot.sessionId;
+            const title = session.title ?? labels.sessionUntitled;
+            const hasActions = snapshot.capabilities.deleteSession && !active;
+            const menuOpen = session.sessionId === menuSessionId;
+            return (
+              <div
+                className="paui-session"
+                data-active={active || undefined}
+                data-has-actions={hasActions || undefined}
+                data-loaded={session.loaded !== undefined || undefined}
+                data-menu-open={menuOpen || undefined}
+                key={session.sessionId}
               >
-                <strong>{session.title ?? labels.sessionUntitled}</strong>
-                <span className="paui-session__meta">
-                  {session.loaded
-                    ? labels.sessionPhase(session.loaded.phase)
-                    : formatSessionDate(session.updatedAt)}
-                  {session.loaded?.interactionCount ? (
+                <button
+                  className="paui-session__select"
+                  type="button"
+                  aria-current={active ? "page" : undefined}
+                  disabled={loading || active}
+                  onClick={() => void select(session.sessionId)}
+                >
+                  {session.loaded?.phase === "running" ? (
+                    <span
+                      className="paui-session__spinner"
+                      aria-hidden="true"
+                    />
+                  ) : null}
+                  <strong className="paui-session__title">{title}</strong>
+                </button>
+                <span className="paui-session__trailing">
+                  <span className="paui-session__meta">
                     <span>
-                      {labels.pendingInteractions(
-                        session.loaded.interactionCount,
-                      )}
+                      {session.loaded
+                        ? labels.sessionPhase(session.loaded.phase)
+                        : formatSessionAge(
+                            session.updatedAt,
+                            drawerNow,
+                            labels.sessionAge,
+                          )}
                     </span>
+                    {session.loaded?.interactionCount ? (
+                      <>
+                        <span
+                          className="paui-session__meta-separator"
+                          aria-hidden="true"
+                        >
+                          ·
+                        </span>
+                        <span>
+                          {labels.pendingInteractions(
+                            session.loaded.interactionCount,
+                          )}
+                        </span>
+                      </>
+                    ) : null}
+                  </span>
+                  {hasActions ? (
+                    <button
+                      className="paui-session__action"
+                      type="button"
+                      aria-controls={
+                        menuOpen ? `${ids.instance}-session-menu` : undefined
+                      }
+                      aria-expanded={menuOpen}
+                      aria-haspopup="menu"
+                      aria-label={labels.sessionActions(title)}
+                      disabled={loading}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        if (menuOpen) {
+                          closeMenu(true);
+                          return;
+                        }
+                        menuTriggerRef.current = event.currentTarget;
+                        setMenuPosition(undefined);
+                        setMenuSessionId(session.sessionId);
+                      }}
+                    >
+                      <EllipsisIcon />
+                    </button>
                   ) : null}
                 </span>
-              </button>
-              {session.loaded && snapshot.capabilities.closeSession ? (
-                <button
-                  className="paui-icon-button"
-                  type="button"
-                  disabled={
-                    loading ||
-                    session.loaded.phase === "running" ||
-                    session.loaded.phase === "cancelling" ||
-                    session.loaded.interactionCount > 0
-                  }
-                  title={labels.closeSession}
-                  onClick={() => void closeSession(session.sessionId)}
-                >
-                  <CloseIcon />
-                  <span className="paui-sr-only">{labels.closeSession}</span>
-                </button>
-              ) : snapshot.capabilities.deleteSession &&
-                session.sessionId !== snapshot.sessionId ? (
-                <button
-                  className="paui-icon-button"
-                  type="button"
-                  title={labels.deleteSession}
-                  onClick={() => {
-                    if (
-                      window.confirm(
-                        labels.confirmDeleteSession(
-                          session.title ?? labels.sessionUntitled,
-                        ),
-                      )
-                    )
-                      void controller
-                        .deleteSession(session.sessionId)
-                        .catch((reason: unknown) =>
-                          setError(
-                            reason instanceof Error
-                              ? reason.message
-                              : String(reason),
-                          ),
-                        );
-                  }}
-                >
-                  <TrashIcon />
-                  <span className="paui-sr-only">{labels.deleteSession}</span>
-                </button>
-              ) : null}
-            </div>
-          ))}
+              </div>
+            );
+          })}
           {snapshot.sessions?.nextCursor ? (
             <button
               className="paui-load-more"
@@ -2285,6 +2653,34 @@ function SessionDrawer({
             </span>
           ) : null}
         </div>
+        {menuSession &&
+        snapshot.capabilities.deleteSession &&
+        menuSession.sessionId !== snapshot.sessionId ? (
+          <div
+            ref={menuRef}
+            id={`${ids.instance}-session-menu`}
+            className="paui-session-menu"
+            role="menu"
+            aria-label={labels.sessionActions(
+              menuSession.title ?? labels.sessionUntitled,
+            )}
+            style={menuPosition ?? { visibility: "hidden" }}
+          >
+            <button
+              ref={menuItemRef}
+              type="button"
+              role="menuitem"
+              aria-disabled={menuDeleteDisabled}
+              onClick={() => {
+                if (menuDeleteDisabled) return;
+                void deleteSession(menuSession);
+              }}
+            >
+              <TrashIcon />
+              <span>{labels.deleteSession}</span>
+            </button>
+          </div>
+        ) : null}
       </aside>
     </div>
   );
@@ -2322,20 +2718,6 @@ function activeElementFor(element: Element | null): Element | null {
     return root.activeElement;
   }
   return document.activeElement;
-}
-
-function formatRawToolValue(value: unknown): string {
-  const rendered =
-    typeof value === "string"
-      ? value
-      : (() => {
-          try {
-            return JSON.stringify(value, null, 2) ?? String(value);
-          } catch {
-            return String(value);
-          }
-        })();
-  return rendered.slice(0, 100_000);
 }
 
 const markdown = new Marked({ gfm: true, breaks: true });
@@ -2469,23 +2851,31 @@ function activityStatus(activity: ChatActivity): string | undefined {
       return activity.pending ? "pending" : undefined;
     case "unsupported":
       return "unsupported";
+    case "context":
+    case "notice":
+      return undefined;
   }
 }
 
-function formatSessionDate(value?: string): string {
+export function formatSessionAge(
+  value?: string,
+  now: number = Date.now(),
+  format: ChatLabels["sessionAge"] = defaultLabels.sessionAge,
+): string {
   if (!value) return "";
-  const date = new Date(value);
-  return Number.isNaN(date.valueOf())
-    ? value
-    : SESSION_DATE_FORMATTER.format(date);
+  const at = new Date(value).valueOf();
+  if (Number.isNaN(at)) return value;
+  const minute = 60_000;
+  const hour = 60 * minute;
+  const day = 24 * hour;
+  const diff = Math.max(0, now - at);
+  if (diff < minute) return format(0, "now");
+  if (diff < hour) return format(Math.floor(diff / minute), "minute");
+  if (diff < day) return format(Math.floor(diff / hour), "hour");
+  if (diff < 30 * day) return format(Math.floor(diff / day), "day");
+  if (diff < 365 * day) return format(Math.floor(diff / (30 * day)), "month");
+  return format(Math.floor(diff / (365 * day)), "year");
 }
-
-const SESSION_DATE_FORMATTER = new Intl.DateTimeFormat(undefined, {
-  month: "short",
-  day: "numeric",
-  hour: "2-digit",
-  minute: "2-digit",
-});
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -2522,6 +2912,13 @@ const CloseIcon = () => (
     <path d="m5 5 10 10M15 5 5 15" />
   </Icon>
 );
+const EllipsisIcon = () => (
+  <Icon>
+    <circle cx="5" cy="10" r="1" fill="currentColor" stroke="none" />
+    <circle cx="10" cy="10" r="1" fill="currentColor" stroke="none" />
+    <circle cx="15" cy="10" r="1" fill="currentColor" stroke="none" />
+  </Icon>
+);
 const TrashIcon = () => (
   <Icon>
     <path d="M4 6h12M8 3h4l1 3M6 6l1 11h6l1-11M9 9v5M12 9v5" />
@@ -2553,6 +2950,11 @@ const BackIcon = () => (
 const ChevronIcon = () => (
   <svg viewBox="0 0 14 14" aria-hidden="true" focusable="false">
     <path d="m4 5.5 3 3 3-3" />
+  </svg>
+);
+const ConfigCheckIcon = () => (
+  <svg viewBox="0 0 14 14" aria-hidden="true" focusable="false">
+    <path d="m3 7 2.5 2.5L11 4" />
   </svg>
 );
 const ToolIcon = () => (
@@ -2642,6 +3044,12 @@ const InfoIcon = () => (
   <Icon>
     <circle cx="10" cy="10" r="7" />
     <path d="M10 9v5M10 6h.01" />
+  </Icon>
+);
+const WarningIcon = () => (
+  <Icon>
+    <path d="M10 2 19 18H1L10 2Z" />
+    <path d="M10 7v5M10 15h.01" />
   </Icon>
 );
 const SparkIcon = () => (

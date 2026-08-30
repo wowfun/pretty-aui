@@ -27,6 +27,8 @@ export type {
   ChatInteraction,
   ChatSessionPhase,
   ChatMessage,
+  ChatNoticeActivity,
+  ChatNoticeInput,
   ChatOptions,
   ChatPhase,
   ChatPlan,

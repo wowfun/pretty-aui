@@ -1,6 +1,7 @@
 import type {
   ChatController,
   ChatInput,
+  ChatNoticeInput,
   ChatSnapshot,
   ChatTurnHandle,
   ElicitationDecision,
@@ -39,6 +40,7 @@ const EMPTY_SNAPSHOT: ChatSnapshot = {
 export class FakeChatController implements ChatController {
   readonly ready = Promise.resolve();
   readonly sent: ChatInput[] = [];
+  readonly appendedNotices: ChatNoticeInput[] = [];
   readonly permissionDecisions: {
     readonly id: string;
     readonly decision: PermissionDecision;
@@ -69,6 +71,7 @@ export class FakeChatController implements ChatController {
   }[] = [];
   sendError: unknown;
   cancelError: unknown;
+  deleteSessionError: unknown;
   openChildSessionError: unknown;
   openAncestorSessionError: unknown;
   turnDone: Promise<{ readonly stopReason: string }> = Promise.resolve({
@@ -103,6 +106,11 @@ export class FakeChatController implements ChatController {
       this.unsubscribeCalls += 1;
       this.#listeners.delete(listener);
     };
+  }
+
+  appendNotice(input: ChatNoticeInput): boolean {
+    this.appendedNotices.push(input);
+    return true;
   }
 
   send(input: ChatInput): ChatTurnHandle {
@@ -156,6 +164,7 @@ export class FakeChatController implements ChatController {
   }
 
   async deleteSession(sessionId: string): Promise<void> {
+    if (this.deleteSessionError) throw this.deleteSessionError;
     this.deletedSessions.push(sessionId);
   }
 

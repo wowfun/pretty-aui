@@ -53,6 +53,7 @@ export interface FakeAgentHarnessOptions {
     ((sessionId: string) => Promise<void>) | undefined;
   readonly beforeCloseSession?:
     ((sessionId: string) => Promise<void>) | undefined;
+  readonly beforeSetConfigOption?: (() => Promise<void>) | undefined;
   readonly beforePromptAck?: (() => Promise<void>) | undefined;
   readonly permissionSessionId?: string | undefined;
   readonly beforeElicitationComplete?: (() => Promise<void>) | undefined;
@@ -64,10 +65,21 @@ export interface FakeAgentHarnessOptions {
   readonly cancelIdleDelayMs?: number | undefined;
   readonly authenticationRequired?: boolean | undefined;
   readonly authenticationFailure?: boolean | undefined;
+  readonly promptFailure?: boolean | undefined;
+  readonly echoUserPromptAsText?: boolean | undefined;
+  readonly replayPromptsAsText?: boolean | undefined;
+  readonly omitReplayEnvelopeClose?: boolean | undefined;
+  readonly omitReplayEnvelope?: boolean | undefined;
+  readonly splitReplayTextChunks?: boolean | undefined;
   readonly closeSessionFailure?: boolean | undefined;
+  readonly configOptionFailure?: boolean | undefined;
   readonly logoutFailure?: boolean | undefined;
   readonly paginatedSessions?: boolean | undefined;
   readonly modeOnlySessionOrdinals?: readonly number[] | undefined;
+  readonly loadedModel?: string | undefined;
+  readonly modelConfig?: boolean | undefined;
+  readonly modelConfigId?: string | undefined;
+  readonly v2ReplayUserContent?: readonly ContentBlock[] | undefined;
   readonly usage?: { readonly used: number; readonly size: number } | undefined;
 }
 
@@ -240,14 +252,58 @@ export function createV1Harness(
       }
       for (const [promptIndex, prompt] of (stored?.prompts ?? []).entries()) {
         for (const content of prompt) {
-          await client.notify(v1.methods.client.session.update, {
-            sessionId: params.sessionId,
-            update: {
-              sessionUpdate: "user_message_chunk",
-              messageId: `replay-user-${promptIndex}`,
-              content,
-            },
-          });
+          if (
+            (options.omitReplayEnvelope || options.omitReplayEnvelopeClose) &&
+            content.type === "text" &&
+            typeof content.text === "string" &&
+            (content.text.startsWith("\n</pretty-aui-user-message-v1-") ||
+              (options.omitReplayEnvelope &&
+                content.text.startsWith("\n\n<pretty-aui-user-message-v1-")))
+          ) {
+            continue;
+          }
+          const embedded = embeddedResourceText(content);
+          const replayContent = options.replayPromptsAsText
+            ? content.type === "text" && typeof content.text === "string"
+              ? { type: "text" as const, text: content.text }
+              : embedded
+                ? {
+                    type: "text" as const,
+                    text: `[${embedded.uri}]\n${embedded.text}`,
+                  }
+                : content
+            : content;
+          const replayChunks =
+            options.splitReplayTextChunks &&
+            replayContent.type === "text" &&
+            typeof replayContent.text === "string" &&
+            replayContent.text.length > 1
+              ? [
+                  {
+                    type: "text" as const,
+                    text: replayContent.text.slice(
+                      0,
+                      Math.floor(replayContent.text.length / 2),
+                    ),
+                  },
+                  {
+                    type: "text" as const,
+                    text: replayContent.text.slice(
+                      Math.floor(replayContent.text.length / 2),
+                    ),
+                  },
+                ]
+              : [replayContent];
+          for (const replayChunk of replayChunks) {
+            await client.notify(v1.methods.client.session.update, {
+              sessionId: params.sessionId,
+              update: {
+                sessionUpdate: "user_message_chunk",
+                messageId: `replay-user-${promptIndex}`,
+                content: replayChunk,
+              },
+            });
+          }
         }
       }
       await client.notify(v1.methods.client.session.update, {
@@ -261,14 +317,19 @@ export function createV1Harness(
           },
         },
       });
+      const loadedModel = options.loadedModel ?? "loaded";
       return {
         configOptions: [
           {
             id: "model",
             name: "Model",
             type: "select" as const,
-            currentValue: "loaded",
-            options: [{ value: "loaded", name: "Loaded" }],
+            currentValue: loadedModel,
+            options: [
+              { value: loadedModel, name: loadedModel },
+              { value: "fast", name: "Fast" },
+              { value: "balanced", name: "Balanced" },
+            ],
           },
         ],
       };
@@ -290,7 +351,14 @@ export function createV1Harness(
       modeUpdates.push({ sessionId: params.sessionId, value: params.modeId });
       return {};
     })
-    .onRequest(v1.methods.agent.session.setConfigOption, ({ params }) => {
+    .onRequest(v1.methods.agent.session.setConfigOption, async ({ params }) => {
+      await options.beforeSetConfigOption?.();
+      if (options.configOptionFailure) {
+        throw v1.RequestError.internalError(
+          undefined,
+          "Fixture config option failed",
+        );
+      }
       configUpdates.push({
         sessionId: params.sessionId,
         id: params.configId,
@@ -304,7 +372,8 @@ export function createV1Harness(
             type: "select" as const,
             currentValue: String(params.value),
             options: [
-              { value: String(params.value), name: String(params.value) },
+              { value: "fast", name: "Fast" },
+              { value: "balanced", name: "Balanced" },
             ],
           },
         ],
@@ -338,6 +407,26 @@ export function createV1Harness(
         });
       }
       const text = promptText(params.prompt);
+      if (options.echoUserPromptAsText) {
+        for (const content of prompt) {
+          const embedded = embeddedResourceText(content);
+          const echoedText =
+            content.type === "text" && typeof content.text === "string"
+              ? content.text
+              : embedded
+                ? `[${embedded.uri}]\n${embedded.text}`
+                : "";
+          if (!echoedText) continue;
+          await client.notify(v1.methods.client.session.update, {
+            sessionId: params.sessionId,
+            update: {
+              sessionUpdate: "user_message_chunk",
+              messageId: "echoed-user",
+              content: { type: "text", text: echoedText },
+            },
+          });
+        }
+      }
       await client.notify(v1.methods.client.session.update, {
         sessionId: params.sessionId,
         update: {
@@ -393,6 +482,54 @@ export function createV1Harness(
                 background: false,
               },
             },
+          },
+        });
+      }
+      if (text.includes("structured tool cards")) {
+        await client.notify(v1.methods.client.session.update, {
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: "tool_call",
+            toolCallId: "execute-card",
+            title: "Execute workspace checks",
+            kind: "execute",
+            status: "in_progress",
+            rawInput: {
+              command: "printf 'alpha\\nbeta\\n'",
+              cwd: "/workspace",
+            },
+          },
+        });
+        await client.notify(v1.methods.client.session.update, {
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: "execute-card",
+            status: "completed",
+            content: [
+              {
+                type: "content",
+                content: { type: "text", text: "alpha\nbeta\n" },
+              },
+            ],
+          },
+        });
+        await client.notify(v1.methods.client.session.update, {
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: "tool_call",
+            toolCallId: "diff-card",
+            title: "Edit fixture.ts",
+            kind: "edit",
+            status: "completed",
+            content: [
+              {
+                type: "diff",
+                path: "/workspace/fixture.ts",
+                oldText: "const state = 'old';",
+                newText: "const state = 'new';",
+              },
+            ],
           },
         });
       }
@@ -453,6 +590,11 @@ export function createV1Harness(
           title: "Read project notes",
           kind: "read",
           status: "in_progress",
+          locations: [{ path: "/workspace/project-notes.md" }],
+          rawInput: {
+            filePath: "/workspace/project-notes.md",
+            offset: 1,
+          },
         },
       });
       if (text.includes("permission")) {
@@ -498,9 +640,20 @@ export function createV1Harness(
           content: [
             {
               type: "content",
-              content: { type: "text", text: "Found 3 relevant notes." },
+              content: {
+                type: "text",
+                text: "1: Found 3 relevant notes.\n2: Keep contracts upstream.\n3: Preserve bounded payloads.",
+              },
             },
           ],
+          rawOutput: {
+            metadata: {
+              display: {
+                type: "file",
+                text: "Found 3 relevant notes.\nKeep contracts upstream.\nPreserve bounded payloads.",
+              },
+            },
+          },
         },
       });
       await client.notify(v1.methods.client.session.update, {
@@ -529,6 +682,9 @@ export function createV1Harness(
           },
         },
       });
+      if (options.promptFailure) {
+        throw v1.RequestError.internalError(undefined, "Fixture prompt failed");
+      }
       return { stopReason: "end_turn" };
     })
     .onNotification(v1.methods.agent.session.cancel, () => undefined);
@@ -564,11 +720,19 @@ export function createV2Harness(
     | "idleBeforePromptAck"
     | "omitIdleAfterPrompt"
     | "paginatedSessions"
+    | "modelConfig"
+    | "modelConfigId"
+    | "v2ReplayUserContent"
   > = {},
 ): FakeAgentHarness {
   const prompts: { sessionId: string; prompt: readonly ContentBlock[] }[] = [];
   const elicitationResponses: unknown[] = [];
   const listSessionCursors: (string | undefined)[] = [];
+  const configUpdates: {
+    sessionId: string;
+    id: string;
+    value: string | boolean;
+  }[] = [];
   const sessions = new Map<string, { cwd: v2.AbsolutePath }>();
   let sessionCounter = 0;
   const app = v2
@@ -589,7 +753,26 @@ export function createV2Harness(
     .onRequest(v2.methods.agent.session.new, ({ params }) => {
       const sessionId = `v2-session-${++sessionCounter}`;
       sessions.set(sessionId, { cwd: params.cwd });
-      return { sessionId };
+      return {
+        sessionId,
+        ...(options.modelConfig
+          ? {
+              configOptions: [
+                {
+                  configId: options.modelConfigId ?? "model",
+                  name: "Model",
+                  category: "model",
+                  type: "select",
+                  currentValue: "balanced",
+                  options: [
+                    { value: "fast", name: "Fast" },
+                    { value: "balanced", name: "Balanced" },
+                  ],
+                },
+              ],
+            }
+          : {}),
+      };
     })
     .onRequest(v2.methods.agent.session.list, async ({ params }) => {
       listSessionCursors.push(params.cursor ?? undefined);
@@ -616,6 +799,16 @@ export function createV2Harness(
     })
     .onRequest(v2.methods.agent.session.resume, async ({ params, client }) => {
       if (params.replayFrom?.type === "start") {
+        if (options.v2ReplayUserContent) {
+          await client.notify(v2.methods.client.session.update, {
+            sessionId: params.sessionId,
+            update: {
+              sessionUpdate: "user_message",
+              messageId: "restored-user-v2",
+              content: options.v2ReplayUserContent,
+            },
+          });
+        }
         await client.notify(v2.methods.client.session.update, {
           sessionId: params.sessionId,
           update: {
@@ -631,16 +824,34 @@ export function createV2Harness(
     .onRequest(v2.methods.agent.session.delete, ({ params }) => {
       sessions.delete(params.sessionId);
     })
-    .onRequest(v2.methods.agent.session.setConfigOption, ({ params }) => ({
-      configOptions: [
-        {
-          configId: params.configId,
-          name: "Option",
-          type: params.type,
-          currentValue: params.value,
-        } as never,
-      ],
-    }))
+    .onRequest(v2.methods.agent.session.setConfigOption, ({ params }) => {
+      if (
+        typeof params.value !== "string" &&
+        typeof params.value !== "boolean"
+      ) {
+        throw new Error("Unexpected config value in the v2 test agent");
+      }
+      configUpdates.push({
+        sessionId: params.sessionId,
+        id: params.configId,
+        value: params.value,
+      });
+      return {
+        configOptions: [
+          {
+            configId: params.configId,
+            name: "Model",
+            category: "model",
+            type: params.type,
+            currentValue: params.value,
+            options: [
+              { value: "fast", name: "Fast" },
+              { value: "balanced", name: "Balanced" },
+            ],
+          } as never,
+        ],
+      };
+    })
     .onRequest(v2.methods.agent.session.prompt, async ({ params, client }) => {
       prompts.push({
         sessionId: params.sessionId,
@@ -744,6 +955,7 @@ export function createV2Harness(
   return harnessFor(app as unknown as AppLike, prompts, {
     elicitationResponses,
     listSessionCursors,
+    configUpdates,
   });
 }
 
@@ -872,4 +1084,20 @@ function promptText(
     .filter((block) => block.type === "text" && typeof block.text === "string")
     .map((block) => block.text)
     .join("\n");
+}
+
+function embeddedResourceText(
+  block: ContentBlock,
+): { readonly uri: string; readonly text: string } | undefined {
+  if (
+    block.type !== "resource" ||
+    typeof block.resource !== "object" ||
+    block.resource === null
+  ) {
+    return undefined;
+  }
+  const resource = block.resource as Record<string, unknown>;
+  return typeof resource.uri === "string" && typeof resource.text === "string"
+    ? { uri: resource.uri, text: resource.text }
+    : undefined;
 }

@@ -12,10 +12,11 @@ export function wireMessageWithinBudget(
     return false;
   }
   if (serialized === undefined) return false;
-  return utf8ByteLength(serialized, limit) <= limit;
+  return utf8StringWithinBudget(serialized, limit);
 }
 
-function utf8ByteLength(value: string, limit: number): number {
+/** Checks a string without scanning beyond the first byte over the limit. */
+export function utf8StringWithinBudget(value: string, limit: number): boolean {
   let bytes = 0;
   for (let index = 0; index < value.length; index += 1) {
     const code = value.charCodeAt(index);
@@ -33,7 +34,7 @@ function utf8ByteLength(value: string, limit: number): number {
     } else {
       bytes += 3;
     }
-    if (bytes > limit) return bytes;
+    if (bytes > limit) return false;
   }
-  return bytes;
+  return true;
 }

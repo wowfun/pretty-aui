@@ -27,6 +27,52 @@ describe("TimelineStore", () => {
     );
   });
 
+  it("keeps 64 transient notices without consuming the Agent activity budget", () => {
+    const timeline = new TimelineStore();
+    for (let index = 0; index < 1_000; index += 1) {
+      timeline.reduce(
+        {
+          sessionUpdate: "agent_message",
+          messageId: `message-${index}`,
+          content: [{ type: "text", text: String(index) }],
+        },
+        2,
+      );
+    }
+    for (let index = 0; index < 70; index += 1) {
+      timeline.addNotice({
+        type: "notice",
+        id: `notice-${index}`,
+        text: String(index),
+        level: "info",
+      });
+    }
+
+    const activities = timeline.activities;
+    expect(
+      activities.filter((activity) => activity.type !== "notice"),
+    ).toHaveLength(1_000);
+    const notices = activities.filter((activity) => activity.type === "notice");
+    expect(notices).toHaveLength(64);
+    expect(notices[0]?.id).toBe("notice-6");
+    expect(notices.at(-1)?.id).toBe("notice-69");
+    expect(activities[0]?.id).toBe("message:assistant:message-0");
+  });
+
+  it("drops transient notices with a full timeline reset", () => {
+    const timeline = new TimelineStore();
+    timeline.addNotice({
+      type: "notice",
+      id: "notice-1",
+      text: "Connected",
+      level: "info",
+    });
+
+    timeline.reset();
+
+    expect(timeline.activities).toEqual([]);
+  });
+
   it("caps a streamed text content block at 1 MiB", () => {
     const timeline = new TimelineStore();
     timeline.reduce(
@@ -124,6 +170,68 @@ describe("TimelineStore", () => {
         uri: "https://example.com/x",
       },
       { type: "resource", resource: { uri: "file:///workspace/a.ts" } },
+    ]);
+  });
+
+  it("retains only valid reserved context metadata for replay recovery", () => {
+    const contextMeta = {
+      "pretty-aui/context": {
+        version: 1,
+        id: "trial",
+        label: "Evaluation trial",
+      },
+    };
+    expect(
+      normalizeContent([
+        {
+          type: "resource",
+          resource: { uri: "peval://source/trial", text: "evidence" },
+          _meta: contextMeta,
+        },
+        {
+          type: "resource_link",
+          name: "inert identifier",
+          uri: "javascript:alert(1)",
+          _meta: contextMeta,
+        },
+        {
+          type: "text",
+          text: "ordinary",
+          _meta: { untrusted: { active: true } },
+        },
+        {
+          type: "resource",
+          resource: { uri: "javascript:alert(1)" },
+          _meta: {
+            "pretty-aui/context": { version: 1, id: "", label: "invalid" },
+          },
+        },
+        {
+          type: "resource_link",
+          name: "invalid-version",
+          uri: "javascript:alert(1)",
+          _meta: {
+            "pretty-aui/context": {
+              version: "1",
+              id: "trial",
+              label: "invalid",
+            },
+          },
+        },
+      ]),
+    ).toEqual([
+      {
+        type: "resource",
+        resource: { uri: "peval://source/trial", text: "evidence" },
+        _meta: contextMeta,
+      },
+      {
+        type: "resource_link",
+        name: "inert identifier",
+        uri: "javascript:alert(1)",
+        _meta: contextMeta,
+      },
+      { type: "text", text: "ordinary" },
     ]);
   });
 
@@ -297,6 +405,207 @@ describe("TimelineStore", () => {
       },
     ]);
     expect(new Set(messages.map((message) => message.id)).size).toBe(2);
+  });
+
+  it("preserves a reliable local user timestamp through ACP echoes", () => {
+    const v1Timeline = new TimelineStore();
+    v1Timeline.addUserMessage(
+      [{ type: "text", text: "local v1" }],
+      true,
+      1_000,
+    );
+    v1Timeline.reduce(
+      {
+        sessionUpdate: "user_message_chunk",
+        messageId: "v1-user",
+        content: { type: "text", text: "local v1" },
+      },
+      1,
+    );
+
+    const v2Timeline = new TimelineStore();
+    v2Timeline.addUserMessage(
+      [{ type: "text", text: "local v2" }],
+      true,
+      2_000,
+    );
+    v2Timeline.reduce(
+      {
+        sessionUpdate: "user_message",
+        messageId: "v2-user",
+        content: [{ type: "text", text: "local v2" }],
+      },
+      2,
+    );
+
+    expect(v1Timeline.activities[0]).toMatchObject({ timestamp: 1_000 });
+    expect(v2Timeline.activities[0]).toMatchObject({ timestamp: 2_000 });
+  });
+
+  it("retains Agent user updates after the canonical local turn settles", () => {
+    const timeline = new TimelineStore();
+    timeline.addUserMessage(
+      [{ type: "text", text: "local prompt" }],
+      true,
+      1_000,
+    );
+    timeline.reduce(
+      {
+        sessionUpdate: "user_message",
+        messageId: "local-echo",
+        content: [{ type: "text", text: "local prompt" }],
+      },
+      2,
+    );
+    timeline.reduce(
+      {
+        sessionUpdate: "agent_message",
+        messageId: "answer",
+        content: [{ type: "text", text: "answer" }],
+      },
+      2,
+    );
+    timeline.finishTurn(2_000);
+
+    timeline.reduce(
+      {
+        sessionUpdate: "user_message",
+        messageId: "later-user",
+        content: [{ type: "text", text: "later user update" }],
+      },
+      2,
+    );
+
+    expect(
+      timeline.activities.flatMap((activity) =>
+        activity.type === "message" && activity.role === "user"
+          ? [activity.content]
+          : [],
+      ),
+    ).toEqual([
+      [{ type: "text", text: "local prompt" }],
+      [{ type: "text", text: "later user update" }],
+    ]);
+  });
+
+  it("keeps the active canonical user in place at activity capacity", () => {
+    const echoes = [
+      {
+        protocol: 1 as const,
+        update: {
+          sessionUpdate: "user_message_chunk",
+          messageId: "wire-v1-user",
+          content: { type: "text", text: "locally submitted" },
+        },
+      },
+      {
+        protocol: 2 as const,
+        update: {
+          sessionUpdate: "user_message",
+          messageId: "wire-v2-user",
+          content: [{ type: "text", text: "locally submitted" }],
+        },
+      },
+    ];
+
+    for (const { protocol, update } of echoes) {
+      const timeline = new TimelineStore();
+      timeline.addUserMessage(
+        [{ type: "text", text: "locally submitted" }],
+        true,
+        1_000,
+      );
+      for (let index = 0; index < 1_000; index += 1) {
+        timeline.reduce(
+          {
+            sessionUpdate: "agent_message",
+            messageId: `capacity-${index}`,
+            content: [{ type: "text", text: String(index) }],
+          },
+          2,
+        );
+      }
+
+      expect(timeline.activities).toHaveLength(1_000);
+      expect(timeline.activities[0]).toMatchObject({
+        role: "user",
+        content: [{ type: "text", text: "locally submitted" }],
+        timestamp: 1_000,
+      });
+      expect(timeline.activities[1]?.id).toBe("message:assistant:capacity-1");
+
+      timeline.reduce(update, protocol);
+
+      expect(timeline.activities[0]).toMatchObject({
+        role: "user",
+        content: [{ type: "text", text: "locally submitted" }],
+        timestamp: 1_000,
+      });
+    }
+  });
+
+  it("omits invalid local event times at the timeline boundary", () => {
+    const timeline = new TimelineStore();
+    for (const timestamp of [-1, Number.NaN, Infinity, 8.64e15 + 1]) {
+      timeline.addUserMessage(
+        [{ type: "text", text: String(timestamp) }],
+        false,
+        timestamp,
+      );
+    }
+    expect(
+      timeline.activities.every(
+        (activity) =>
+          activity.type !== "message" || activity.timestamp === undefined,
+      ),
+    ).toBe(true);
+
+    const answerTimeline = new TimelineStore();
+    answerTimeline.addUserMessage([{ type: "text", text: "question" }], false);
+    answerTimeline.reduce(
+      {
+        sessionUpdate: "agent_message",
+        messageId: "answer",
+        content: [{ type: "text", text: "answer" }],
+      },
+      2,
+    );
+    answerTimeline.markFinalAnswer(Number.NaN);
+    expect(answerTimeline.activities.at(-1)).not.toHaveProperty("timestamp");
+  });
+
+  it("timestamps only the final live answer when explicitly completed", () => {
+    const timeline = new TimelineStore();
+    timeline.addUserMessage([{ type: "text", text: "question" }], false);
+    timeline.reduce(
+      {
+        sessionUpdate: "agent_message_chunk",
+        messageId: "intermediate",
+        content: { type: "text", text: "intermediate" },
+      },
+      2,
+    );
+    timeline.reduce(
+      {
+        sessionUpdate: "agent_message",
+        messageId: "final",
+        content: [{ type: "text", text: "final" }],
+      },
+      2,
+    );
+
+    expect(
+      timeline.activities.filter((activity) => activity.type === "message"),
+    ).toEqual([
+      expect.not.objectContaining({ timestamp: expect.anything() }),
+      expect.not.objectContaining({ timestamp: expect.anything() }),
+      expect.not.objectContaining({ timestamp: expect.anything() }),
+    ]);
+
+    timeline.markFinalAnswer(3_000);
+
+    expect(timeline.activities[1]).not.toHaveProperty("timestamp");
+    expect(timeline.activities[2]).toMatchObject({ timestamp: 3_000 });
   });
 
   it("normalizes an OpenCode task as a subagent and adds its settled child session", () => {

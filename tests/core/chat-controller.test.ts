@@ -7,6 +7,10 @@ import type {
 } from "../../src/core/index.js";
 import { createV1Harness, createV2Harness } from "../helpers/agents.js";
 
+const DECOY_ENVELOPE_TOKEN = "11111111111111111111111111111111";
+const CURRENT_ENVELOPE_TOKEN = "22222222222222222222222222222222";
+const INCOMPLETE_ENVELOPE_TOKEN = "33333333333333333333333333333333";
+
 describe("ChatController protocol interface", () => {
   it("can connect without creating an orphan initial session", async () => {
     const harness = createV1Harness();
@@ -36,12 +40,578 @@ describe("ChatController protocol interface", () => {
     }
   });
 
+  it("routes transient notices to current and background loaded sessions", async () => {
+    const harness = createV1Harness();
+    const controller = createChat({
+      connector: harness.connector,
+      session: { cwd: "/workspace" },
+    });
+    try {
+      await controller.ready;
+      const firstSessionId = controller.getSnapshot().sessionId!;
+
+      expect(
+        controller.appendNotice({ text: "Connected", level: "info" }),
+      ).toBe(true);
+      await controller.newSession();
+      const secondSessionId = controller.getSnapshot().sessionId!;
+      expect(
+        controller.appendNotice({ text: "Context attached", level: "info" }),
+      ).toBe(true);
+      expect(
+        controller.appendNotice({
+          text: "Background connection failed",
+          level: "error",
+          sessionId: firstSessionId,
+        }),
+      ).toBe(true);
+
+      expect(
+        controller
+          .getSnapshot()
+          .activities.filter((activity) => activity.type === "notice"),
+      ).toEqual([
+        expect.objectContaining({
+          type: "notice",
+          text: "Context attached",
+          level: "info",
+        }),
+      ]);
+
+      await controller.openSession(firstSessionId);
+      expect(
+        controller
+          .getSnapshot()
+          .activities.filter((activity) => activity.type === "notice"),
+      ).toEqual([
+        expect.objectContaining({ text: "Connected", level: "info" }),
+        expect.objectContaining({
+          text: "Background connection failed",
+          level: "error",
+        }),
+      ]);
+      expect(
+        controller.appendNotice({
+          text: "Missing",
+          level: "error",
+          sessionId: "missing-session",
+        }),
+      ).toBe(false);
+      expect(harness.prompts).toEqual([]);
+      expect(harness.configUpdates).toEqual([]);
+
+      await controller.openSession(secondSessionId);
+      expect(
+        controller
+          .getSnapshot()
+          .activities.filter((activity) => activity.type === "notice"),
+      ).toHaveLength(1);
+    } finally {
+      await controller.destroy();
+      expect(controller.appendNotice({ text: "Too late", level: "info" })).toBe(
+        false,
+      );
+      await harness.close();
+    }
+  });
+
+  it("validates transient notice inputs at the public seam", async () => {
+    const harness = createV1Harness();
+    const controller = createChat({
+      connector: harness.connector,
+      session: { cwd: "/workspace" },
+    });
+    try {
+      await controller.ready;
+
+      expect(() =>
+        controller.appendNotice({ text: "", level: "info" }),
+      ).toThrow(
+        expect.objectContaining({
+          code: "INVALID_CONFIGURATION",
+          phase: "notice",
+        }),
+      );
+      for (const sessionId of ["", "   "]) {
+        expect(() =>
+          controller.appendNotice({
+            text: "Invalid target",
+            level: "info",
+            sessionId,
+          }),
+        ).toThrow(
+          expect.objectContaining({
+            code: "INVALID_CONFIGURATION",
+            phase: "notice",
+          }),
+        );
+      }
+      expect(() =>
+        controller.appendNotice({
+          text: "x".repeat(16 * 1024 + 1),
+          level: "error",
+        }),
+      ).toThrow(expect.objectContaining({ code: "INVALID_CONFIGURATION" }));
+      expect(() =>
+        controller.appendNotice({
+          text: "😀".repeat(4 * 1024 + 1),
+          level: "error",
+        }),
+      ).toThrow(expect.objectContaining({ code: "INVALID_CONFIGURATION" }));
+      expect(() =>
+        controller.appendNotice({ text: "Invalid", level: "warning" } as never),
+      ).toThrow(expect.objectContaining({ code: "INVALID_CONFIGURATION" }));
+      expect(
+        controller.appendNotice({
+          text: "x".repeat(16 * 1024),
+          level: "info",
+        }),
+      ).toBe(true);
+      expect(
+        controller.appendNotice({
+          text: "😀".repeat(4 * 1024),
+          level: "info",
+        }),
+      ).toBe(true);
+    } finally {
+      await controller.destroy();
+      await harness.close();
+    }
+  });
+
+  it("matches explicit notice targets as opaque session IDs", async () => {
+    const harness = createV1Harness();
+    const controller = createChat({
+      connector: harness.connector,
+      session: { cwd: "/workspace" },
+    });
+    try {
+      await controller.ready;
+      await controller.openSession(" padded-session ");
+
+      expect(
+        controller.appendNotice({
+          text: "Exact target",
+          level: "info",
+          sessionId: " padded-session ",
+        }),
+      ).toBe(true);
+      expect(
+        controller.appendNotice({
+          text: "Different target",
+          level: "info",
+          sessionId: "padded-session",
+        }),
+      ).toBe(false);
+      expect(
+        controller
+          .getSnapshot()
+          .activities.filter((activity) => activity.type === "notice"),
+      ).toEqual([
+        expect.objectContaining({ text: "Exact target", level: "info" }),
+      ]);
+    } finally {
+      await controller.destroy();
+      await harness.close();
+    }
+  });
+
+  it("does not restore transient notices in a new controller load", async () => {
+    const harness = createV1Harness();
+    const first = createChat({
+      connector: harness.connector,
+      session: { cwd: "/workspace" },
+    });
+    await first.ready;
+    const sessionId = first.getSnapshot().sessionId!;
+    expect(
+      first.appendNotice({ text: "Controller-local", level: "info" }),
+    ).toBe(true);
+    await first.destroy();
+
+    const restored = createChat({
+      connector: harness.connector,
+      session: { cwd: "/workspace" },
+      initialSession: { type: "open", sessionId },
+    });
+    try {
+      await restored.ready;
+
+      expect(
+        restored
+          .getSnapshot()
+          .activities.filter((activity) => activity.type === "notice"),
+      ).toEqual([]);
+      expect(harness.loadSessionRequests).toBe(1);
+    } finally {
+      await restored.destroy();
+      await harness.close();
+    }
+  });
+
+  it.each([
+    { name: "resume reconnect", loadOnly: false, expected: 1 },
+    { name: "full history load", loadOnly: true, expected: 0 },
+  ])(
+    "$name retains only the owning timeline's transient notices",
+    async ({ loadOnly, expected }) => {
+      const harness = createV1Harness({ loadOnly });
+      const controller = createChat({
+        connector: harness.connector,
+        session: { cwd: "/workspace" },
+      });
+      try {
+        await controller.ready;
+        expect(
+          controller.appendNotice({ text: "Local status", level: "info" }),
+        ).toBe(true);
+
+        await controller.reconnect();
+
+        expect(
+          controller
+            .getSnapshot()
+            .activities.filter((activity) => activity.type === "notice"),
+        ).toHaveLength(expected);
+      } finally {
+        await controller.destroy();
+        await harness.close();
+      }
+    },
+  );
+
+  it("uses the current model for a genuinely new session", async () => {
+    const harness = createV1Harness();
+    const controller = createChat({
+      connector: harness.connector,
+      protocol: 1,
+      session: { cwd: "/workspace" },
+    });
+    try {
+      await controller.ready;
+      const firstSessionId = controller.getSnapshot().sessionId!;
+      await controller.setConfigOption("model", "fast");
+
+      await controller.newSession();
+      const secondSessionId = controller.getSnapshot().sessionId!;
+
+      expect(controller.getSnapshot().configOptions).toEqual([
+        expect.objectContaining({ id: "model", currentValue: "fast" }),
+      ]);
+      expect(harness.configUpdates).toEqual([
+        { sessionId: firstSessionId, id: "model", value: "fast" },
+        { sessionId: secondSessionId, id: "model", value: "fast" },
+      ]);
+    } finally {
+      await controller.destroy();
+      await harness.close();
+    }
+  });
+
+  it("restores a persisted model for the initial new session", async () => {
+    const harness = createV1Harness();
+    const controller = createChat({
+      connector: harness.connector,
+      protocol: 1,
+      session: { cwd: "/workspace" },
+      modelPreference: {
+        get: () => "fast",
+        set: () => undefined,
+      },
+    });
+    try {
+      await controller.ready;
+      const sessionId = controller.getSnapshot().sessionId!;
+
+      expect(controller.getSnapshot().configOptions).toEqual([
+        expect.objectContaining({ id: "model", currentValue: "fast" }),
+      ]);
+      expect(harness.configUpdates).toEqual([
+        { sessionId, id: "model", value: "fast" },
+      ]);
+    } finally {
+      await controller.destroy();
+      await harness.close();
+    }
+  });
+
+  it("replaces an unavailable persisted model with the Agent default", async () => {
+    const harness = createV1Harness();
+    const savedModels: string[] = [];
+    const controller = createChat({
+      connector: harness.connector,
+      protocol: 1,
+      session: { cwd: "/workspace" },
+      modelPreference: {
+        get: () => "retired-model",
+        set: (value) => savedModels.push(value),
+      },
+    });
+    try {
+      await controller.ready;
+
+      expect(controller.getSnapshot().configOptions).toEqual([
+        expect.objectContaining({ id: "model", currentValue: "balanced" }),
+      ]);
+      expect(harness.configUpdates).toEqual([]);
+      expect(savedModels).toEqual(["balanced"]);
+    } finally {
+      await controller.destroy();
+      await harness.close();
+    }
+  });
+
+  it("keeps an opened session's model and uses it for the next new session", async () => {
+    const harness = createV1Harness({ loadedModel: "fast" });
+    const controller = createChat({
+      connector: harness.connector,
+      protocol: 1,
+      session: { cwd: "/workspace" },
+    });
+    try {
+      await controller.ready;
+      await controller.openSession("existing-session");
+
+      expect(controller.getSnapshot().configOptions).toEqual([
+        expect.objectContaining({ id: "model", currentValue: "fast" }),
+      ]);
+      expect(harness.configUpdates).toEqual([]);
+
+      await controller.newSession();
+      const newSessionId = controller.getSnapshot().sessionId!;
+      expect(controller.getSnapshot().configOptions).toEqual([
+        expect.objectContaining({ id: "model", currentValue: "fast" }),
+      ]);
+      expect(harness.configUpdates).toEqual([
+        { sessionId: newSessionId, id: "model", value: "fast" },
+      ]);
+    } finally {
+      await controller.destroy();
+      await harness.close();
+    }
+  });
+
+  it("restores the model through the ACP v2 driver", async () => {
+    const harness = createV2Harness(0, {
+      modelConfig: true,
+      modelConfigId: "provider",
+    });
+    const controller = createChat({
+      connector: harness.connector,
+      protocol: 2,
+      session: { cwd: "/workspace" },
+      modelPreference: { get: () => "fast", set: () => undefined },
+    });
+    try {
+      await controller.ready;
+      const sessionId = controller.getSnapshot().sessionId!;
+
+      expect(controller.getSnapshot().configOptions).toEqual([
+        expect.objectContaining({
+          id: "provider",
+          category: "model",
+          currentValue: "fast",
+        }),
+      ]);
+      expect(harness.configUpdates).toEqual([
+        { sessionId, id: "provider", value: "fast" },
+      ]);
+    } finally {
+      await controller.destroy();
+      await harness.close();
+    }
+  });
+
+  it("keeps sessions usable when the model preference store fails", async () => {
+    const harness = createV1Harness();
+    const diagnostics: string[] = [];
+    const controller = createChat({
+      connector: harness.connector,
+      protocol: 1,
+      session: { cwd: "/workspace" },
+      modelPreference: {
+        get: () => {
+          throw new Error("storage read failed");
+        },
+        set: () => {
+          throw new Error("storage write failed");
+        },
+      },
+      onEvent: (event) => {
+        if (event.type === "diagnostic") diagnostics.push(event.code);
+      },
+    });
+    try {
+      await controller.ready;
+
+      expect(controller.getSnapshot()).toMatchObject({
+        phase: "idle",
+        configOptions: [
+          expect.objectContaining({ id: "model", currentValue: "balanced" }),
+        ],
+      });
+      expect(diagnostics).toEqual([
+        "MODEL_PREFERENCE_READ_FAILED",
+        "MODEL_PREFERENCE_WRITE_FAILED",
+      ]);
+    } finally {
+      await controller.destroy();
+      await harness.close();
+    }
+  });
+
+  it("uses the Agent default when restoring a valid model is rejected", async () => {
+    const harness = createV1Harness({ configOptionFailure: true });
+    const diagnostics: string[] = [];
+    const controller = createChat({
+      connector: harness.connector,
+      protocol: 1,
+      session: { cwd: "/workspace" },
+      modelPreference: { get: () => "fast", set: () => undefined },
+      onEvent: (event) => {
+        if (event.type === "diagnostic") diagnostics.push(event.code);
+      },
+    });
+    try {
+      await controller.ready;
+
+      expect(controller.getSnapshot()).toMatchObject({
+        phase: "idle",
+        loadedSessions: [expect.objectContaining({ phase: "idle" })],
+        configOptions: [
+          expect.objectContaining({ id: "model", currentValue: "balanced" }),
+        ],
+      });
+      expect(diagnostics).toContain("MODEL_PREFERENCE_APPLY_FAILED");
+    } finally {
+      await controller.destroy();
+      await harness.close();
+    }
+  });
+
+  it("preserves connection loss while restoring a model preference", async () => {
+    let harness: ReturnType<typeof createV1Harness>;
+    harness = createV1Harness({
+      beforeSetConfigOption: () => harness.disconnect(),
+    });
+    const diagnostics: string[] = [];
+    const controller = createChat({
+      connector: harness.connector,
+      protocol: 1,
+      session: { cwd: "/workspace" },
+      modelPreference: { get: () => "fast", set: () => undefined },
+      onEvent: (event) => {
+        if (event.type === "diagnostic") diagnostics.push(event.code);
+      },
+    });
+    try {
+      await expect(controller.ready).rejects.toMatchObject({
+        code: "CONNECTION_CLOSED",
+      });
+      expect(controller.getSnapshot()).toMatchObject({
+        phase: "error",
+        error: { code: "CONNECTION_CLOSED" },
+      });
+      expect(diagnostics).not.toContain("MODEL_PREFERENCE_APPLY_FAILED");
+    } finally {
+      await controller.destroy();
+      await harness.close();
+    }
+  });
+
+  it("ignores an oversized persisted model value", async () => {
+    const harness = createV1Harness();
+    const diagnostics: string[] = [];
+    const controller = createChat({
+      connector: harness.connector,
+      protocol: 1,
+      session: { cwd: "/workspace" },
+      modelPreference: {
+        get: () => "x".repeat(16 * 1024 + 1),
+        set: () => undefined,
+      },
+      onEvent: (event) => {
+        if (event.type === "diagnostic") diagnostics.push(event.code);
+      },
+    });
+    try {
+      await controller.ready;
+
+      expect(controller.getSnapshot().configOptions).toEqual([
+        expect.objectContaining({ id: "model", currentValue: "balanced" }),
+      ]);
+      expect(harness.configUpdates).toEqual([]);
+      expect(diagnostics).toContain("INVALID_MODEL_PREFERENCE");
+    } finally {
+      await controller.destroy();
+      await harness.close();
+    }
+  });
+
+  it("measures persisted model bounds in UTF-8 bytes", async () => {
+    const harness = createV1Harness();
+    const diagnostics: string[] = [];
+    const controller = createChat({
+      connector: harness.connector,
+      protocol: 1,
+      session: { cwd: "/workspace" },
+      modelPreference: {
+        get: () => "🚀".repeat(4 * 1024 + 1),
+        set: () => undefined,
+      },
+      onEvent: (event) => {
+        if (event.type === "diagnostic") diagnostics.push(event.code);
+      },
+    });
+    try {
+      await controller.ready;
+
+      expect(controller.getSnapshot().configOptions).toEqual([
+        expect.objectContaining({ id: "model", currentValue: "balanced" }),
+      ]);
+      expect(harness.configUpdates).toEqual([]);
+      expect(diagnostics).toContain("INVALID_MODEL_PREFERENCE");
+    } finally {
+      await controller.destroy();
+      await harness.close();
+    }
+  });
+
+  it("does not treat legacy ACP modes as model preferences", async () => {
+    const harness = createV1Harness({ modeOnlySessionOrdinals: [1, 2] });
+    const savedModels: string[] = [];
+    const controller = createChat({
+      connector: harness.connector,
+      protocol: 1,
+      session: { cwd: "/workspace" },
+      modelPreference: {
+        get: () => "fast",
+        set: (value) => savedModels.push(value),
+      },
+    });
+    try {
+      await controller.ready;
+      await controller.newSession();
+
+      expect(controller.getSnapshot().configOptions).toEqual([
+        expect.objectContaining({ id: "mode", currentValue: "balanced" }),
+      ]);
+      expect(harness.modeUpdates).toEqual([]);
+      expect(harness.configUpdates).toEqual([]);
+      expect(savedModels).toEqual([]);
+    } finally {
+      await controller.destroy();
+      await harness.close();
+    }
+  });
+
   it("surfaces authentication required by a later session creation", async () => {
     const harness = createV1Harness({ authenticationRequired: true });
     const controller = createChat({
       connector: harness.connector,
       session: { cwd: "/workspace" },
       initialSession: { type: "none" },
+      modelPreference: { get: () => "fast", set: () => undefined },
     });
     try {
       await controller.ready;
@@ -56,8 +626,16 @@ describe("ChatController protocol interface", () => {
       });
 
       await controller.authenticate("login");
-      expect(controller.getSnapshot().phase).toBe("idle");
-      expect(controller.getSnapshot().sessionId).toBeDefined();
+      const sessionId = controller.getSnapshot().sessionId!;
+      expect(controller.getSnapshot()).toMatchObject({
+        phase: "idle",
+        configOptions: [
+          expect.objectContaining({ id: "model", currentValue: "fast" }),
+        ],
+      });
+      expect(harness.configUpdates).toEqual([
+        { sessionId, id: "model", value: "fast" },
+      ]);
     } finally {
       await controller.destroy();
       await harness.close();
@@ -331,6 +909,93 @@ describe("ChatController protocol interface", () => {
     expect(controller.getSnapshot().phase).toBe("idle");
     await controller.destroy();
     await harness.close();
+  });
+
+  it("records reliable local times for a submitted user and completed answer", async () => {
+    const harness = createV1Harness();
+    const controller = createChat({
+      connector: harness.connector,
+      session: { cwd: "/workspace" },
+    });
+    try {
+      await controller.ready;
+      const earliest = Date.now();
+      await expect(controller.send("time this turn").done).resolves.toEqual({
+        stopReason: "end_turn",
+      });
+      const latest = Date.now();
+      const messages = controller
+        .getSnapshot()
+        .activities.filter((activity) => activity.type === "message");
+      const user = messages.find((message) => message.role === "user");
+      const assistant = messages.find(
+        (message) => message.role === "assistant",
+      );
+
+      expect(user?.timestamp).toBeGreaterThanOrEqual(earliest);
+      expect(user?.timestamp).toBeLessThanOrEqual(latest);
+      expect(assistant?.timestamp).toBeGreaterThanOrEqual(user!.timestamp!);
+      expect(assistant?.timestamp).toBeLessThanOrEqual(latest);
+    } finally {
+      await controller.destroy();
+      await harness.close();
+    }
+  });
+
+  it("keeps a completed answer causally ordered when the wall clock moves backwards", async () => {
+    const harness = createV1Harness();
+    const controller = createChat({
+      connector: harness.connector,
+      session: { cwd: "/workspace" },
+    });
+    const now = vi.spyOn(Date, "now");
+    try {
+      await controller.ready;
+      now.mockReturnValueOnce(2_000).mockReturnValueOnce(1_000);
+
+      await controller.send("time moved backwards").done;
+
+      const messages = controller
+        .getSnapshot()
+        .activities.filter((activity) => activity.type === "message");
+      expect(
+        messages.find((message) => message.role === "user")?.timestamp,
+      ).toBe(2_000);
+      expect(
+        messages.find((message) => message.role === "assistant")?.timestamp,
+      ).toBe(2_000);
+    } finally {
+      now.mockRestore();
+      await controller.destroy();
+      await harness.close();
+    }
+  });
+
+  it("does not timestamp a partial answer when the turn fails", async () => {
+    const harness = createV1Harness({ promptFailure: true });
+    const controller = createChat({
+      connector: harness.connector,
+      session: { cwd: "/workspace" },
+    });
+    try {
+      await controller.ready;
+      await expect(controller.send("fail this turn").done).rejects.toThrow(
+        "Fixture prompt failed",
+      );
+      const messages = controller
+        .getSnapshot()
+        .activities.filter((activity) => activity.type === "message");
+
+      expect(
+        messages.find((message) => message.role === "user")?.timestamp,
+      ).toEqual(expect.any(Number));
+      expect(
+        messages.find((message) => message.role === "assistant"),
+      ).not.toHaveProperty("timestamp");
+    } finally {
+      await controller.destroy();
+      await harness.close();
+    }
   });
 
   it("cancels permission requests for a different session", async () => {
@@ -991,6 +1656,7 @@ describe("ChatController protocol interface", () => {
     });
     try {
       await controller.ready;
+      await controller.setConfigOption("model", "fast");
       await controller.send("Old session message").done;
       const previousSessionId = controller.getSnapshot().sessionId;
       expect(controller.getSnapshot().activities.length).toBeGreaterThan(0);
@@ -1000,6 +1666,18 @@ describe("ChatController protocol interface", () => {
       expect(controller.getSnapshot().sessionId).not.toBe(previousSessionId);
       expect(controller.getSnapshot().activities).toEqual([]);
       expect(harness.newSessionRequests).toBe(2);
+      expect(harness.configUpdates).toEqual([
+        {
+          sessionId: previousSessionId,
+          id: "model",
+          value: "fast",
+        },
+        {
+          sessionId: controller.getSnapshot().sessionId,
+          id: "model",
+          value: "fast",
+        },
+      ]);
     } finally {
       await controller.destroy();
       await harness.close();
@@ -1208,20 +1886,78 @@ describe("ChatController protocol interface", () => {
         }),
       ]),
     );
-    expect(harness.prompts[0]?.prompt.map((block) => block.type)).toEqual([
+    const prompt = harness.prompts[0]?.prompt ?? [];
+    expect(prompt.map((block) => block.type)).toEqual([
+      "text",
+      "text",
       "text",
       "text",
     ]);
-    expect(harness.prompts[0]?.prompt[0]?._meta).toMatchObject({
+    expect(prompt[0]?._meta).toMatchObject({
       "pretty-aui/context": {
         version: 1,
         id: "page",
         label: "Current page",
       },
     });
-    expect(activities[1]?.content).toEqual([harness.prompts[0]?.prompt[0]]);
+    expect(prompt[2]).toEqual({ type: "text", text: "Hello" });
+    const opening = prompt[1];
+    expect(opening).toMatchObject({ type: "text" });
+    if (opening?.type !== "text" || typeof opening.text !== "string") {
+      throw new Error("Expected a text prompt envelope");
+    }
+    const match = opening.text.match(
+      /^\n\n<pretty-aui-user-message-v1-([a-f0-9]{32})>\n$/,
+    );
+    expect(match?.[1]).toBeTruthy();
+    expect(prompt[3]).toEqual({
+      type: "text",
+      text: `\n</pretty-aui-user-message-v1-${match?.[1]}>`,
+    });
+    expect(activities[1]?.content).toEqual([prompt[0]]);
     await controller.destroy();
     await harness.close();
+  });
+
+  it("sends prompts without resolved context unchanged", async () => {
+    const harness = createV1Harness();
+    const controller = createChat({
+      connector: harness.connector,
+      session: { cwd: "/workspace" },
+    });
+    const input = [
+      { type: "text" as const, text: "Inspect this image" },
+      { type: "image" as const, mimeType: "image/png", data: "aGVsbG8=" },
+    ];
+    try {
+      await controller.ready;
+      await controller.send(input).done;
+      expect(harness.prompts[0]?.prompt).toEqual(input);
+    } finally {
+      await controller.destroy();
+      await harness.close();
+    }
+  });
+
+  it("sends v2 prompts without resolved context unchanged", async () => {
+    const harness = createV2Harness();
+    const controller = createChat({
+      connector: harness.connector,
+      protocol: 2,
+      session: { cwd: "/workspace" },
+    });
+    const input = [
+      { type: "text" as const, text: "Inspect this image" },
+      { type: "image" as const, mimeType: "image/png", data: "aGVsbG8=" },
+    ];
+    try {
+      await controller.ready;
+      await controller.send(input).done;
+      expect(harness.prompts[0]?.prompt).toEqual(input);
+    } finally {
+      await controller.destroy();
+      await harness.close();
+    }
   });
 
   it("projects an observable context selection and exposes add and remove actions", async () => {
@@ -1391,7 +2127,13 @@ describe("ChatController protocol interface", () => {
       ).toEqual([
         "Current page content",
         "Current task content",
+        expect.stringMatching(
+          /^\n\n<pretty-aui-user-message-v1-[a-f0-9]{32}>\n$/,
+        ),
         "Inspect both",
+        expect.stringMatching(
+          /^\n<\/pretty-aui-user-message-v1-[a-f0-9]{32}>$/,
+        ),
       ]);
       expect(
         controller
@@ -1556,6 +2298,36 @@ describe("ChatController protocol interface", () => {
     }
   });
 
+  it("counts user-message envelope blocks against the ACP prompt limit", async () => {
+    const harness = createV1Harness();
+    const controller = createChat({
+      connector: harness.connector,
+      session: { cwd: "/workspace" },
+      context: [
+        {
+          id: "page",
+          label: "Current page",
+          content: [{ type: "text", text: "Page context" }],
+        },
+      ],
+    });
+    const input = Array.from({ length: 254 }, (_, index) => ({
+      type: "text" as const,
+      text: `Input ${index}`,
+    }));
+    try {
+      await controller.ready;
+      await expect(controller.send(input).done).rejects.toMatchObject({
+        code: "INVALID_CONFIGURATION",
+        phase: "prompt",
+      });
+      expect(harness.prompts).toHaveLength(0);
+    } finally {
+      await controller.destroy();
+      await harness.close();
+    }
+  });
+
   it("keeps submitted context out of the canonical v2 user message", async () => {
     const harness = createV2Harness();
     const controller = createChat({
@@ -1585,6 +2357,563 @@ describe("ChatController protocol interface", () => {
       ).toMatchObject({
         content: [{ type: "text", text: "Only the user prompt" }],
       });
+      const prompt = harness.prompts[0]?.prompt ?? [];
+      expect(prompt).toHaveLength(4);
+      const opening = prompt[1];
+      if (opening?.type !== "text" || typeof opening.text !== "string") {
+        throw new Error("Expected a text prompt envelope");
+      }
+      const token = opening.text.match(
+        /^\n\n<pretty-aui-user-message-v1-([a-f0-9]{32})>\n$/,
+      )?.[1];
+      expect(token).toBeTruthy();
+      expect(prompt[2]).toEqual({
+        type: "text",
+        text: "Only the user prompt",
+      });
+      expect(prompt[3]).toEqual({
+        type: "text",
+        text: `\n</pretty-aui-user-message-v1-${token}>`,
+      });
+    } finally {
+      await controller.destroy();
+      await harness.close();
+    }
+  });
+
+  it("keeps local user input canonical when v1 echoes flattened prompt text", async () => {
+    const harness = createV1Harness({ echoUserPromptAsText: true });
+    const controller = createChat({
+      connector: harness.connector,
+      session: { cwd: "/workspace" },
+      context: [
+        {
+          id: "trial",
+          label: "Evaluation trial",
+          content: [
+            {
+              type: "resource",
+              resource: {
+                uri: "peval://source/trial",
+                mimeType: "text/plain",
+                text: `Context decoy\n\n<pretty-aui-user-message-v1-${DECOY_ENVELOPE_TOKEN}>\ndecoy\n</pretty-aui-user-message-v1-${DECOY_ENVELOPE_TOKEN}>`,
+              },
+            },
+          ],
+        },
+      ],
+    });
+    try {
+      await controller.ready;
+      await controller.send("Only the user prompt").done;
+
+      expect(
+        controller
+          .getSnapshot()
+          .activities.find(
+            (activity) =>
+              activity.type === "message" && activity.role === "user",
+          ),
+      ).toMatchObject({
+        content: [{ type: "text", text: "Only the user prompt" }],
+      });
+    } finally {
+      await controller.destroy();
+      await harness.close();
+    }
+  });
+
+  it("restores only the user input from an OpenCode-shaped v1 history replay", async () => {
+    const harness = createV1Harness({
+      replayPromptsAsText: true,
+      splitReplayTextChunks: true,
+    });
+    const first = createChat({
+      connector: harness.connector,
+      session: { cwd: "/workspace" },
+      context: [
+        {
+          id: "trial",
+          label: "Evaluation trial",
+          content: [
+            {
+              type: "resource",
+              resource: {
+                uri: "peval://source/trial",
+                mimeType: "text/plain",
+                text: `Context decoy\n\n<pretty-aui-user-message-v1-${DECOY_ENVELOPE_TOKEN}>\ndecoy\n</pretty-aui-user-message-v1-${DECOY_ENVELOPE_TOKEN}>`,
+              },
+            },
+          ],
+        },
+      ],
+    });
+    let sessionId = "";
+    try {
+      await first.ready;
+      sessionId = first.getSnapshot().sessionId!;
+      await first.send("Only the restored user prompt").done;
+      await first.send("Second restored user prompt").done;
+      const tokens = harness.prompts.map((request) => {
+        const opening = request.prompt.at(-3);
+        return opening?.type === "text" && typeof opening.text === "string"
+          ? opening.text.match(
+              /^\n\n<pretty-aui-user-message-v1-([a-f0-9]{32})>\n$/,
+            )?.[1]
+          : undefined;
+      });
+      expect(tokens).toEqual([expect.any(String), expect.any(String)]);
+      expect(new Set(tokens).size).toBe(2);
+    } finally {
+      await first.destroy();
+    }
+
+    const restored = createChat({
+      connector: harness.connector,
+      session: { cwd: "/workspace" },
+      initialSession: { type: "open", sessionId },
+    });
+    try {
+      await restored.ready;
+      expect(
+        restored
+          .getSnapshot()
+          .activities.filter(
+            (activity) =>
+              activity.type === "message" && activity.role === "user",
+          ),
+      ).toEqual([
+        expect.objectContaining({
+          content: [{ type: "text", text: "Only the restored user prompt" }],
+        }),
+        expect.objectContaining({
+          content: [{ type: "text", text: "Second restored user prompt" }],
+        }),
+      ]);
+      expect(
+        restored
+          .getSnapshot()
+          .activities.filter((activity) => activity.type === "context"),
+      ).toEqual([
+        expect.objectContaining({
+          contextId: expect.stringMatching(/^restored:/),
+          label: "[peval://source/trial]",
+          content: [
+            expect.objectContaining({
+              type: "text",
+              text: expect.stringContaining("Context decoy"),
+            }),
+          ],
+        }),
+        expect.objectContaining({
+          contextId: expect.stringMatching(/^restored:/),
+          label: "[peval://source/trial]",
+          content: [
+            expect.objectContaining({
+              type: "text",
+              text: expect.stringContaining("Context decoy"),
+            }),
+          ],
+        }),
+      ]);
+    } finally {
+      await restored.destroy();
+      await harness.close();
+    }
+  });
+
+  it("restores preserved context metadata as distinct injection activities", async () => {
+    const harness = createV1Harness();
+    const first = createChat({
+      connector: harness.connector,
+      session: { cwd: "/workspace" },
+      context: [
+        {
+          id: "trial",
+          label: "Evaluation trial",
+          content: [
+            {
+              type: "resource",
+              resource: {
+                uri: "peval://source/trial",
+                mimeType: "text/plain",
+                text: "Trial evidence",
+              },
+            },
+          ],
+        },
+        {
+          id: "report",
+          label: "Failure report",
+          content: [{ type: "text", text: "Report evidence" }],
+        },
+      ],
+    });
+    let sessionId = "";
+    try {
+      await first.ready;
+      sessionId = first.getSnapshot().sessionId!;
+      await first.send("Compare the evidence").done;
+    } finally {
+      await first.destroy();
+    }
+
+    const restored = createChat({
+      connector: harness.connector,
+      session: { cwd: "/workspace" },
+      initialSession: { type: "open", sessionId },
+    });
+    try {
+      await restored.ready;
+      const activities = restored.getSnapshot().activities;
+      expect(activities.slice(0, 3)).toEqual([
+        expect.objectContaining({
+          type: "message",
+          role: "user",
+          content: [{ type: "text", text: "Compare the evidence" }],
+        }),
+        expect.objectContaining({
+          type: "context",
+          contextId: "trial",
+          label: "Evaluation trial",
+          content: [
+            expect.objectContaining({
+              type: "resource",
+              resource: expect.objectContaining({ text: "Trial evidence" }),
+            }),
+          ],
+        }),
+        expect.objectContaining({
+          type: "context",
+          contextId: "report",
+          label: "Failure report",
+          content: [expect.objectContaining({ text: "Report evidence" })],
+        }),
+      ]);
+    } finally {
+      await restored.destroy();
+      await harness.close();
+    }
+  });
+
+  it("keeps malformed replay envelopes usable and reports a diagnostic", async () => {
+    const harness = createV1Harness({
+      replayPromptsAsText: true,
+      omitReplayEnvelopeClose: true,
+    });
+    const first = createChat({
+      connector: harness.connector,
+      session: { cwd: "/workspace" },
+      context: [
+        {
+          id: "trial",
+          label: "Evaluation trial",
+          content: [
+            {
+              type: "text",
+              text: `Context body\n\n<pretty-aui-user-message-v1-${DECOY_ENVELOPE_TOKEN}>\ndecoy\n</pretty-aui-user-message-v1-${DECOY_ENVELOPE_TOKEN}>`,
+            },
+          ],
+        },
+      ],
+    });
+    let sessionId = "";
+    try {
+      await first.ready;
+      sessionId = first.getSnapshot().sessionId!;
+      await first.send("Preserve this query").done;
+    } finally {
+      await first.destroy();
+    }
+
+    const diagnostics: string[] = [];
+    const restored = createChat({
+      connector: harness.connector,
+      session: { cwd: "/workspace" },
+      initialSession: { type: "open", sessionId },
+      onEvent(event) {
+        if (event.type === "diagnostic") diagnostics.push(event.code);
+      },
+    });
+    try {
+      await restored.ready;
+      const user = restored
+        .getSnapshot()
+        .activities.find(
+          (activity) => activity.type === "message" && activity.role === "user",
+        );
+      expect(user).toMatchObject({
+        content: [
+          expect.objectContaining({
+            type: "text",
+            text: expect.stringContaining("Preserve this query"),
+          }),
+        ],
+      });
+      expect(diagnostics).toContain("MALFORMED_USER_MESSAGE_ENVELOPE");
+      expect(
+        restored
+          .getSnapshot()
+          .activities.some((activity) => activity.type === "context"),
+      ).toBe(false);
+      expect(restored.getSnapshot().phase).toBe("idle");
+    } finally {
+      await restored.destroy();
+      await harness.close();
+    }
+  });
+
+  it("retains unwrapped legacy v1 history without guessing at context", async () => {
+    const harness = createV1Harness({
+      replayPromptsAsText: true,
+      omitReplayEnvelope: true,
+    });
+    const first = createChat({
+      connector: harness.connector,
+      session: { cwd: "/workspace" },
+      context: [
+        {
+          id: "legacy",
+          label: "Legacy context",
+          content: [{ type: "text", text: "Legacy context body" }],
+        },
+      ],
+    });
+    let sessionId = "";
+    try {
+      await first.ready;
+      sessionId = first.getSnapshot().sessionId!;
+      await first.send("Legacy query").done;
+    } finally {
+      await first.destroy();
+    }
+
+    const diagnostics: string[] = [];
+    const restored = createChat({
+      connector: harness.connector,
+      session: { cwd: "/workspace" },
+      initialSession: { type: "open", sessionId },
+      onEvent(event) {
+        if (event.type === "diagnostic") diagnostics.push(event.code);
+      },
+    });
+    try {
+      await restored.ready;
+      expect(
+        restored
+          .getSnapshot()
+          .activities.find(
+            (activity) =>
+              activity.type === "message" && activity.role === "user",
+          ),
+      ).toMatchObject({
+        content: [{ type: "text", text: "Legacy context bodyLegacy query" }],
+      });
+      expect(diagnostics).not.toContain("MALFORMED_USER_MESSAGE_ENVELOPE");
+      expect(
+        restored
+          .getSnapshot()
+          .activities.some((activity) => activity.type === "context"),
+      ).toBe(false);
+    } finally {
+      await restored.destroy();
+      await harness.close();
+    }
+  });
+
+  it("does not infer an envelope from ordinary tag-prefix text", async () => {
+    const diagnostics: string[] = [];
+    const content = [
+      {
+        type: "text" as const,
+        text: "Discuss pretty-aui-user-message-v1- notes",
+      },
+    ];
+    const harness = createV2Harness(0, { v2ReplayUserContent: content });
+    const controller = createChat({
+      connector: harness.connector,
+      protocol: 2,
+      session: { cwd: "/workspace" },
+      initialSession: { type: "open", sessionId: "ordinary-prefix" },
+      onEvent(event) {
+        if (event.type === "diagnostic") diagnostics.push(event.code);
+      },
+    });
+    try {
+      await controller.ready;
+      expect(
+        controller
+          .getSnapshot()
+          .activities.find(
+            (activity) =>
+              activity.type === "message" && activity.role === "user",
+          ),
+      ).toMatchObject({ content });
+      expect(diagnostics).not.toContain("MALFORMED_USER_MESSAGE_ENVELOPE");
+    } finally {
+      await controller.destroy();
+      await harness.close();
+    }
+  });
+
+  it.each([
+    {
+      name: "CRLF normalization",
+      text: `Context\r\n\r\n<pretty-aui-user-message-v1-${CURRENT_ENVELOPE_TOKEN}>\r\nQuestion\r\n</pretty-aui-user-message-v1-${CURRENT_ENVELOPE_TOKEN}>`,
+    },
+    {
+      name: "trimmed opening whitespace",
+      text: `Context<pretty-aui-user-message-v1-${CURRENT_ENVELOPE_TOKEN}>\nQuestion\n</pretty-aui-user-message-v1-${CURRENT_ENVELOPE_TOKEN}>`,
+    },
+    {
+      name: "normalized surrounding whitespace",
+      text: `Context \n<pretty-aui-user-message-v1-${CURRENT_ENVELOPE_TOKEN}> \nQuestion\n </pretty-aui-user-message-v1-${CURRENT_ENVELOPE_TOKEN}>`,
+    },
+  ])("restores an envelope after $name", async ({ name, text }) => {
+    const diagnostics: string[] = [];
+    const harness = createV2Harness(0, {
+      v2ReplayUserContent: [{ type: "text", text }],
+    });
+    const controller = createChat({
+      connector: harness.connector,
+      protocol: 2,
+      session: { cwd: "/workspace" },
+      initialSession: { type: "open", sessionId: `normalized-${name}` },
+      onEvent(event) {
+        if (event.type === "diagnostic") diagnostics.push(event.code);
+      },
+    });
+    try {
+      await controller.ready;
+      expect(
+        controller
+          .getSnapshot()
+          .activities.find(
+            (activity) =>
+              activity.type === "message" && activity.role === "user",
+          ),
+      ).toMatchObject({ content: [{ type: "text", text: "Question" }] });
+      expect(
+        controller
+          .getSnapshot()
+          .activities.find((activity) => activity.type === "context"),
+      ).toMatchObject({ label: "Context" });
+      expect(diagnostics).not.toContain("MALFORMED_USER_MESSAGE_ENVELOPE");
+    } finally {
+      await controller.destroy();
+      await harness.close();
+    }
+  });
+
+  it("restores mixed v2 user content from the last complete envelope", async () => {
+    const harness = createV2Harness(0, {
+      v2ReplayUserContent: [
+        {
+          type: "text",
+          text:
+            "Context with an older marker:\n\n" +
+            `<pretty-aui-user-message-v1-${DECOY_ENVELOPE_TOKEN}>\ndecoy\n` +
+            `</pretty-aui-user-message-v1-${DECOY_ENVELOPE_TOKEN}>` +
+            `\n\n<pretty-aui-user-message-v1-${CURRENT_ENVELOPE_TOKEN.slice(0, 16)}`,
+        },
+        {
+          type: "text",
+          text: `${CURRENT_ENVELOPE_TOKEN.slice(16)}>\nLook `,
+        },
+        { type: "image", mimeType: "image/png", data: "aGVsbG8=" },
+        { type: "audio", mimeType: "audio/wav", data: "d29ybGQ=" },
+        {
+          type: "text",
+          text: `here\n</pretty-aui-user-message-v1-${CURRENT_ENVELOPE_TOKEN.slice(0, 16)}`,
+        },
+        {
+          type: "text",
+          text: `${CURRENT_ENVELOPE_TOKEN.slice(16)}>ignored tail`,
+        },
+      ],
+    });
+    const controller = createChat({
+      connector: harness.connector,
+      protocol: 2,
+      session: { cwd: "/workspace" },
+      initialSession: { type: "open", sessionId: "restored-v2" },
+    });
+    try {
+      await controller.ready;
+      expect(
+        controller
+          .getSnapshot()
+          .activities.find(
+            (activity) =>
+              activity.type === "message" && activity.role === "user",
+          ),
+      ).toMatchObject({
+        content: [
+          { type: "text", text: "Look " },
+          { type: "image", mimeType: "image/png", data: "aGVsbG8=" },
+          { type: "audio", mimeType: "audio/wav", data: "d29ybGQ=" },
+          { type: "text", text: "here" },
+        ],
+      });
+      expect(
+        controller
+          .getSnapshot()
+          .activities.find((activity) => activity.type === "context"),
+      ).toMatchObject({
+        contextId: expect.stringMatching(/^restored:/),
+        label: "Context with an older marker:",
+        content: [
+          expect.objectContaining({
+            type: "text",
+            text: expect.stringContaining("Context with an older marker:"),
+          }),
+        ],
+      });
+    } finally {
+      await controller.destroy();
+      await harness.close();
+    }
+  });
+
+  it("reports a malformed v2 replay envelope without discarding content", async () => {
+    const diagnostics: string[] = [];
+    const harness = createV2Harness(0, {
+      v2ReplayUserContent: [
+        {
+          type: "text",
+          text: `Context\n\n<pretty-aui-user-message-v1-${INCOMPLETE_ENVELOPE_TOKEN}>\nKeep me`,
+        },
+      ],
+    });
+    const controller = createChat({
+      connector: harness.connector,
+      protocol: 2,
+      session: { cwd: "/workspace" },
+      initialSession: { type: "open", sessionId: "malformed-v2" },
+      onEvent(event) {
+        if (event.type === "diagnostic") diagnostics.push(event.code);
+      },
+    });
+    try {
+      await controller.ready;
+      expect(
+        controller
+          .getSnapshot()
+          .activities.find(
+            (activity) =>
+              activity.type === "message" && activity.role === "user",
+          ),
+      ).toMatchObject({
+        content: [
+          expect.objectContaining({ text: expect.stringContaining("Keep me") }),
+        ],
+      });
+      expect(diagnostics).toContain("MALFORMED_USER_MESSAGE_ENVELOPE");
+      expect(
+        controller
+          .getSnapshot()
+          .activities.some((activity) => activity.type === "context"),
+      ).toBe(false);
     } finally {
       await controller.destroy();
       await harness.close();
@@ -2019,6 +3348,16 @@ describe("ChatController protocol interface", () => {
       await expect(settleWithin(turn.done, 100)).resolves.toEqual({
         stopReason: "cancelled",
       });
+      expect(
+        controller
+          .getSnapshot()
+          .activities.filter(
+            (activity) =>
+              activity.type === "message" && activity.role === "assistant",
+          ),
+      ).toEqual([
+        expect.not.objectContaining({ timestamp: expect.anything() }),
+      ]);
       expect(controller.getSnapshot().phase).toBe("cancelling");
       expect(() => controller.send("next turn")).toThrow(
         expect.objectContaining({ code: "SESSION_BUSY" }),
@@ -2079,15 +3418,26 @@ describe("ChatController protocol interface", () => {
   });
 
   it("reconnects a load-only ACP v1 agent to the same session", async () => {
-    const harness = createV1Harness({ loadOnly: true });
+    const harness = createV1Harness({
+      loadOnly: true,
+      replayPromptsAsText: true,
+    });
     const controller = createChat({
       connector: harness.connector,
       protocol: 1,
       session: { cwd: "/workspace" },
+      context: [
+        {
+          id: "reconnect-context",
+          label: "Reconnect context",
+          content: [{ type: "text", text: "Context before reconnect" }],
+        },
+      ],
     });
     try {
       await controller.ready;
       const sessionId = controller.getSnapshot().sessionId;
+      await controller.send("Only the reconnect query").done;
 
       await controller.reconnect();
 
@@ -2096,19 +3446,38 @@ describe("ChatController protocol interface", () => {
       expect(controller.getSnapshot().configOptions).toEqual([
         expect.objectContaining({ id: "model", currentValue: "loaded" }),
       ]);
+      const replayed = controller
+        .getSnapshot()
+        .activities.find(
+          (activity) =>
+            activity.type === "message" &&
+            activity.role === "assistant" &&
+            activity.content.some(
+              (block) =>
+                block.type === "text" && block.text === "Replayed history",
+            ),
+        );
+      expect(replayed).toBeDefined();
+      expect(replayed).not.toHaveProperty("timestamp");
       expect(
         controller
           .getSnapshot()
-          .activities.some(
+          .activities.find(
             (activity) =>
-              activity.type === "message" &&
-              activity.role === "assistant" &&
-              activity.content.some(
-                (block) =>
-                  block.type === "text" && block.text === "Replayed history",
-              ),
+              activity.type === "message" && activity.role === "user",
           ),
-      ).toBe(true);
+      ).toMatchObject({
+        content: [{ type: "text", text: "Only the reconnect query" }],
+      });
+      expect(
+        controller
+          .getSnapshot()
+          .activities.find((activity) => activity.type === "context"),
+      ).toMatchObject({
+        contextId: expect.stringMatching(/^restored:/),
+        label: "Context before reconnect",
+        content: [{ type: "text", text: "Context before reconnect" }],
+      });
     } finally {
       await controller.destroy();
       await harness.close();

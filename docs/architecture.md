@@ -27,9 +27,14 @@ animation frame while always reading the controller's latest immutable state.
 
 Core is framework-neutral. Shared labels, color scheme, and surface vocabulary
 are React-free presentation contracts. React owns component props, visual
-tokens, and tool rendering. Standalone mounts the same React composition into a
-newly attached open Shadow DOM and is not a second renderer. It accepts either
-a caller-owned controller or immutable controller options, never both. A
+tokens, and tool rendering. The built-in tool renderer derives bounded
+presentation models from normalized `ChatToolCall` values: ACP diff content and
+strictly recognized execute or file-read shapes receive structured cards, while
+ambiguous or future Agent payloads retain a generic input/output projection.
+Opaque raw values are never reclassified by loose text heuristics, and content
+not consumed by a specialized card remains visible. Standalone mounts the same
+React composition into a newly attached open Shadow DOM and is not a second
+renderer. It accepts either a caller-owned controller or immutable controller options, never both. A
 borrowed controller outlives the mount; an options-owned controller is destroyed
 with its root. Standalone refuses an existing or concurrently owned shadow
 root, exposes bounded draft and composer-focus operations instead of requiring
@@ -48,7 +53,16 @@ Each record owns its timeline, turn, configuration, usage, protocol state, and
 interactions. A session permits one turn at a time
 while different sessions may run concurrently. Selecting a loaded session
 changes only the active snapshot projection; it never closes or cancels another
-session. Session operations are single-flight per target, and connection
+session. A host may append bounded notice activities to a loaded session through
+the controller. These rows keep their position among the in-memory activities
+but never enter ACP or consume the retained Agent-activity budget. A
+resume-based reconnect retains the existing timeline and its notices; a full
+Agent history load replaces that timeline and removes them. The selected
+session's normalized model configuration becomes the controller preference for
+genuinely new sessions. An optional host adapter may
+restore and persist that one bounded value, but existing or reopened sessions
+keep their Agent-owned configuration and are never overwritten by the
+preference. Session operations are single-flight per target, and connection
 replacement is single-flight for the whole controller. Concurrent session-list
 reads for the same cursor share one request; a different cursor remains busy so
 pagination cannot commit out of order. Unknown-session updates are diagnosed
@@ -69,7 +83,11 @@ sessions serially through resume when available or full load for load-only ACP
 v1 agents. Failure to restore the selected session fails the connection
 replacement; failure to restore a background session marks only that record as
 failed. An agent exposing neither capability receives one genuinely fresh
-session and the prior loaded records are discarded rather than relabeled.
+session and the prior loaded records are discarded rather than relabeled. Every
+fresh-session path applies a compatible preferred model before publishing the
+new selection. A missing model, an unavailable saved value, or a failing
+best-effort preference adapter falls back to the Agent default without making
+the session unusable.
 The package root, `./core`, and `./standalone` entries are React-free;
 `./react` is the only entry whose interface requires the optional React peers.
 Borrowed-controller rendering supports SSR from the controller's current
@@ -79,8 +97,9 @@ only in an effect.
 
 The host owns the outer inline or sidebar shell. The renderer responds to the
 width of its own container and never mutates `body`, installs a viewport-level
-layout, or portals an outer sidebar. Manual composition and theming contracts
-are specified in [Composition](composition.md).
+layout, or portals an outer sidebar. Manual assembly is specified in
+[Composition](composition.md); visual and theming contracts live in the
+[Design system](design-system.md).
 
 Controller construction may connect without creating a session, create a new
 session, or open a named session. The default remains new-session creation.
@@ -96,13 +115,33 @@ The provider receives the frozen IDs, labels, initialized prompt capabilities,
 and user input, and must return the same IDs in the same order; it can therefore
 choose embedded resources or a text fallback without letting composer state,
 wire content, and transparency records diverge. Context is prepended to the ACP
-prompt but committed to the owning session's timeline only after prompt dispatch
-starts. Each accepted item becomes a package-owned context activity following
-that turn's user message, preserving the exact bounded blocks sent for the
-lifetime of the loaded controller session. Context activities are not
-reconstructed from unmarked Agent history and are not a second durable session
-store. A host may forbid agent authentication; an agent that requires it then
-fails explicitly without presenting or sending authentication operations.
+prompt. When context is present, a versioned, per-turn text envelope surrounds
+the original user content so an Agent that flattens or later replays prompt
+blocks retains an explicit model-facing boundary. The locally submitted user
+content remains the canonical live transcript value; redundant Agent user
+echoes never replace or append to it. On a full history load, complete envelopes
+restore the original user content and best-effort context activities from the
+preceding prompt blocks. Preserved reserved metadata restores the original
+context identities and labels; contiguous blocks whose metadata was flattened
+become a bounded recovered context item with a literal-content label. Envelope
+recognition requires the reserved tag plus its bounded token and tolerates
+line-ending or surrounding-whitespace normalization by the Agent. Ordinary
+text that merely mentions the tag prefix remains unwrapped legacy history.
+Malformed envelopes are retained without data loss.
+
+Only the active turn's redundant Agent user echo yields to the locally
+submitted canonical user content. Once that turn settles, later Agent user
+updates are retained normally. The active canonical user occupies one of the
+retained activity slots and is not evicted before its turn settles.
+
+Context is committed to the owning session's timeline only after prompt
+dispatch starts. Each accepted item becomes a package-owned context activity
+following that turn's user message, preserving the exact bounded blocks sent
+for the lifetime of the loaded controller session. Recovered context activities
+remain a presentation of Agent-owned history, not a second durable session
+store or a renewed host reference. A host may forbid agent authentication; an
+agent that requires it then fails explicitly without presenting or sending
+authentication operations.
 
 ## Trust
 
@@ -116,10 +155,13 @@ receive normalized `ChatToolCall` values rather than raw protocol messages.
 
 The default protocol budgets are 2 MiB per decoded inbound or outbound wire
 message, 16 loaded
-sessions, 1,000 retained activities per session, 256 items per normalized
+sessions, 1,000 retained Agent activities plus 64 transient host notices per
+session, 256 items per normalized
 collection, 256 content blocks per message, 1 MiB per text or terminal value, 8
-MiB per base64 media value, and 16 simultaneous interactions across the
-controller. Loading reservations count toward the session limit; capacity
+MiB per base64 media value, 16 KiB per host notice or stored model preference
+measured in UTF-8 bytes,
+and 16 simultaneous interactions across the controller. Loading reservations
+count toward the session limit; capacity
 failure occurs before a remote session operation, and records are never
 implicitly evicted or remotely closed. Structured payloads are copied to at
 most 4,096 nodes and 16 levels. Each terminal accepts at most 4,096 output chunks and 4 MiB
@@ -177,7 +219,7 @@ connections, frames, subprocess pipes, and WebSocket output buffers.
 TypeScript under `src/` is authoritative. `dist/` is generated from it and is
 never edited directly. The readable modular output and browser-ready
 standalone output are tracked and shipped with source maps for consumer
-diagnostics; `build:check` guards them against source drift. Exported types own
+diagnostics; `check:build` guards them against source drift. Exported types own
 field-level contracts, and tests own behavioral evidence. Example applications
 are executable fixtures, not a second source of package behavior. Screenshot
 baselines are reviewed contract artifacts and are changed intentionally.

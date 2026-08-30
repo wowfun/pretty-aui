@@ -86,6 +86,12 @@ button {
   line-height: 1.04;
 }
 
+.demo-intro p {
+  margin: 8px 0 0;
+  color: var(--demo-muted);
+  font-size: 13px;
+}
+
 .demo-controls {
   display: flex;
   padding: 3px;
@@ -111,10 +117,7 @@ button {
 }
 
 .demo-stage {
-  padding: clamp(6px, 1.4vw, 14px);
-  border: 1px solid var(--demo-line);
-  background: color-mix(in srgb, var(--demo-bg) 72%, var(--demo-ink));
-  box-shadow: 0 28px 70px rgb(30 40 33 / 13%);
+  width: min(100%, 950px);
 }
 
 .demo-stage .pretty-aui {
@@ -125,7 +128,6 @@ button {
 
 .demo-foot {
   display: flex;
-  justify-content: space-between;
   gap: 20px;
   padding-top: 12px;
   color: var(--demo-muted);

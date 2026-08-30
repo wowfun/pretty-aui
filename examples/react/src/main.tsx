@@ -2,16 +2,10 @@ import { StrictMode, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Chat,
-  ChatComposer,
-  ChatHeader,
-  ChatInteractions,
-  ChatRoot,
-  ChatTranscript,
   createChat,
   createWebSocketConnector,
   type ChatColorScheme,
   type ContextProvider,
-  type ChatSurface,
   type ToolActivityRenderer,
 } from "../../../src/react/index.js";
 import { createV1Harness } from "../../../tests/helpers/agents.js";
@@ -20,19 +14,9 @@ import "./demo.css";
 
 const query = new URLSearchParams(location.search);
 const injectedLive = window.__PRETTY_AUI_LIVE__;
-const liveUrl = query.get("live") ?? injectedLive?.url ?? null;
-const liveProtocols =
-  liveUrl === injectedLive?.url ? injectedLive.protocols : undefined;
+const liveUrl = injectedLive?.url ?? null;
+const liveProtocols = injectedLive?.protocols;
 const initialScheme = asScheme(query.get("scheme"));
-const environmentSurface = (
-  import.meta as ImportMeta & {
-    readonly env?: { readonly VITE_PRETTY_AUI_SURFACE?: string };
-  }
-).env?.VITE_PRETTY_AUI_SURFACE;
-const surface = asSurface(query.get("surface") ?? environmentSurface ?? null);
-const manualComposition = query.get("composition") === "manual";
-const discloseContext = query.get("context") === "1";
-const composerContext = query.get("composerContext") === "1";
 const harness = liveUrl
   ? undefined
   : createV1Harness({
@@ -42,9 +26,7 @@ const harness = liveUrl
         ? { usage: { used: Number.MAX_VALUE, size: Number.MAX_VALUE } }
         : {}),
     });
-const contextProvider = composerContext
-  ? createDemoContextProvider()
-  : undefined;
+const contextProvider = createDemoContextProvider();
 const controller = createChat({
   connector: liveUrl
     ? createWebSocketConnector(liveUrl, {
@@ -53,38 +35,9 @@ const controller = createChat({
     : harness!.connector,
   protocol: 1,
   session: {
-    cwd: query.get("cwd") ?? injectedLive?.cwd ?? "/workspace/pretty-aui",
+    cwd: injectedLive?.cwd ?? "/workspace/pretty-aui",
   },
-  ...(contextProvider
-    ? { context: contextProvider }
-    : discloseContext
-      ? {
-          context: [
-            {
-              id: "workspace-evidence",
-              label: "Workspace evidence",
-              content: [
-                {
-                  type: "text" as const,
-                  text: [
-                    "Evaluation cell: cell_ff84f016f10d5d9aa7f2",
-                    "Dataset: pbench-v1.0/web-fetch-01",
-                    "Instruction: inspect the captured evidence literally.",
-                  ].join("\n"),
-                },
-                {
-                  type: "resource" as const,
-                  resource: {
-                    uri: "peval://trial/web-fetch-01",
-                    mimeType: "application/json",
-                    text: '{"score":0,"status":"digest_mismatch"}',
-                  },
-                },
-              ],
-            },
-          ],
-        }
-      : {}),
+  context: contextProvider,
   onEvent(event) {
     if (event.type === "error") console.error(event.error);
   },
@@ -139,19 +92,24 @@ window.__PRETTY_AUI__ = controller;
 
 function Demo() {
   const [scheme, setScheme] = useState<ChatColorScheme>(initialScheme);
+  const selectScheme = (value: ChatColorScheme) => {
+    setScheme(value);
+    history.replaceState(null, "", previewHref(value));
+  };
   return (
-    <main className="demo-shell" data-scheme={scheme} data-surface={surface}>
+    <main className="demo-shell" data-scheme={scheme}>
       <header className="demo-intro">
         <div>
           <span className="demo-kicker">pretty-aui · ACP client</span>
-          <h1>Chat that stays close to the protocol.</h1>
+          <h1>Composer context</h1>
+          <p>Choose context for the next turn and inspect what was sent.</p>
         </div>
         <div className="demo-controls" aria-label="Preview theme">
           {(["light", "dark", "system"] as const).map((value) => (
             <button
               type="button"
               data-active={scheme === value || undefined}
-              onClick={() => setScheme(value)}
+              onClick={() => selectScheme(value)}
               key={value}
             >
               {value}
@@ -160,26 +118,12 @@ function Demo() {
         </div>
       </header>
       <section className="demo-stage">
-        {manualComposition ? (
-          <ChatRoot
-            controller={controller}
-            surface={surface}
-            colorScheme={scheme}
-            toolActivityRenderer={renderDemoTool}
-          >
-            <ChatHeader />
-            <ChatTranscript />
-            <ChatInteractions />
-            <ChatComposer />
-          </ChatRoot>
-        ) : (
-          <Chat
-            controller={controller}
-            surface={surface}
-            colorScheme={scheme}
-            toolActivityRenderer={renderDemoTool}
-          />
-        )}
+        <Chat
+          controller={controller}
+          surface="inline"
+          colorScheme={scheme}
+          toolActivityRenderer={renderDemoTool}
+        />
       </section>
       <footer className="demo-foot">
         <span>
@@ -187,7 +131,6 @@ function Demo() {
             ? "Local OpenCode ACP · WebSocket"
             : "Deterministic ACP v1 fixture"}
         </span>
-        <span>React · standalone ESM · Jekyll</span>
       </footer>
     </main>
   );
@@ -206,8 +149,13 @@ function asScheme(value: string | null): ChatColorScheme {
   return value === "dark" || value === "system" ? value : "light";
 }
 
-function asSurface(value: string | null): ChatSurface {
-  return value === "sidebar" ? "sidebar" : "inline";
+function previewHref(scheme: ChatColorScheme): string {
+  const params = new URLSearchParams({ scheme });
+  for (const key of ["thoughtDelay", "subagentDelay", "usage"] as const) {
+    const value = query.get(key);
+    if (value !== null) params.set(key, value);
+  }
+  return `${location.pathname}?${params}${location.hash}`;
 }
 
 function asDelay(value: string | null): number {

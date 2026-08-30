@@ -35,6 +35,41 @@ The session drawer also receives bounded summaries for every loaded session so
 running turns, pending interactions, and failures remain discoverable without
 rendering background transcripts. Draft and transcript scroll state are kept
 per loaded session. Selecting a session never interrupts work in another one.
+The drawer keeps those summaries in one compact line: loaded sessions expose
+their phase and pending interactions, while catalog-only sessions expose a
+compact relative update time. A non-current session exposes its supported
+actions from a keyboard-accessible trailing menu; the built-in menu contains
+only Agent-supported deletion and confirms before deleting. Closing a loaded
+session remains a controller lifecycle operation and is not presented as a row
+action.
+
+Pass a `modelPreference` store in `ChatOptions` when new sessions should reuse
+the model selected in another controller lifetime. The controller recognizes
+the ACP `model` category, with the conventional `model` option ID as a fallback,
+and calls the synchronous store only with one bounded model value. The host owns
+the store's scope and durability. Existing or reopened sessions retain their
+own Agent configuration; selecting one only makes its current model the
+preference for later new sessions.
+
+Composer configuration renders the complete option set published by the Agent.
+Selecting a value applies it through the controller while keeping the remaining
+choices available for a later change. Select configuration uses a package-owned
+listbox so its presentation is themeable across browsers. The trigger retains
+focus while Arrow keys move the active option; Enter or Space commits it,
+Escape closes without changing it, and pointer selection returns focus to the
+trigger.
+
+Call `controller.appendNotice({ text, level, sessionId? })` when a host-owned
+status belongs in one loaded transcript. Omitting `sessionId` targets the active
+session. A supplied session ID is opaque and matched exactly. Notice text is
+limited to 16 KiB measured in UTF-8 bytes. Notices are
+bounded, ordered activities retained only by that loaded
+controller record: they survive ordinary session selection, but a full Agent
+history load or controller destruction removes them, and they are never sent to
+the Agent. A resume-based reconnect retains the existing loaded timeline and
+its notices. The boolean result reports whether the target record existed;
+malformed notice input throws `INVALID_CONFIGURATION`. Hosts that mount
+standalone use the same seam through `mounted.controller`.
 
 ## Tool activity renderer
 
@@ -57,6 +92,16 @@ wrapper. If a custom renderer throws, the built-in body is rendered for the
 remainder of that tool activity; later streaming updates do not retry it or
 repeat its browser-console diagnostic.
 
+The built-in body gives strictly recognized execute calls a terminal card,
+file reads a line-numbered read card, and ACP diff content a diff card. Other
+calls use one input/output card. Long read and diff bodies collapse their middle
+without changing what Copy writes; terminal, read, and diff Copy actions write
+only their semantic result, while generic input and output sections copy
+independently. If an Agent omits or changes a recognized shape, the renderer
+falls back without discarding its normalized content. These presentation models
+are internal; custom renderers continue to receive the unchanged
+`ChatToolCall`.
+
 Tool calls and reasoning use package-owned, single-line disclosure rows. Both
 start collapsed, including failed tools, and the complete row toggles the
 expanded body. A settled reasoning row previews its first line. While the
@@ -70,6 +115,16 @@ disclosure. The row starts collapsed and names the item without exposing its
 payload. Its bounded scroll body renders model-facing text literally, keeps
 resource identifiers inert, and never interprets context as Markdown, HTML, a
 link, or playable media. Repeated per-turn injection produces repeated rows.
+The controller sends context-bearing prompts with a versioned user-content
+envelope while keeping the composer's original content as the canonical user
+bubble. Reopening history written with that envelope removes the model-facing
+context and framing from the restored bubble, then recreates best-effort Context
+injection rows from the preceding prompt blocks. Reserved context metadata, when
+preserved by the Agent, retains item boundaries, IDs, and labels. Flattened
+blocks are shown as bounded recovered context rather than being discarded or
+presented as user input. These rows are historical transcript projections, not
+live host references. Legacy history without an envelope and malformed
+envelopes remain unchanged because their blocks cannot be classified safely.
 
 When a context-provider adapter is configured, the composer renders its current
 selection above the text input as package-owned chips. The leading add action
@@ -99,55 +154,27 @@ as started rather than tracked because its eventual job result is not applied
 to the original ACP tool call.
 
 The built-in session drawer traps keyboard focus while modal and restores focus
-to its opener when closed. Command suggestions use listbox semantics and can be
-selected from the composer with Up, Down, Enter, or Escape. Once arguments have
-started, Enter submits the complete slash command instead of reselecting its
-name. Blocking permission and elicitation cards move focus to their first
-available control, and the transcript itself is keyboard-scrollable. Streaming status is
-announced at the active message rather than making the complete transcript a
-live region.
+to its opener when closed. A session action menu moves focus to its action;
+Escape closes the menu and restores its trigger before Escape can close the
+drawer. Command suggestions use listbox semantics and can be selected from the
+composer with Up, Down, Enter, or Escape. Once arguments have started, Enter
+submits the complete slash command instead of reselecting its name. Blocking
+permission and elicitation cards move focus to their first available control,
+and the transcript itself is keyboard-scrollable. Streaming status is announced
+at the active message rather than making the complete transcript a live region.
 
-## Styling contract
+Host notices render as transcript flow rows independent of user turns.
+Consecutive notices use compact spacing; an informational row is a status and
+an error row is an alert. Notice rows do not gain message actions, and a
+notice-only transcript keeps the empty-session composer in its hero placement.
 
-Internal `.paui-*` class names are implementation details. Stable selectors
-use `data-pretty-aui-slot`:
+## Design system
 
-- `root`, `header`, `transcript`, `message`, `activity`, `interactions`
-- `composer`, `composer-input`, `composer-actions`
+The [Design system](design-system.md) owns visual hierarchy, responsive rules,
+stable `data-pretty-aui-slot` selectors, and public `--pretty-aui-*` custom
+properties. Internal `.paui-*` classes and `--paui-*` variables remain
+implementation details.
 
-Depending on the slot, state is exposed through `data-surface`, `data-scheme`,
-`data-phase`, `data-role`, `data-kind`, `data-status`, and `data-placement`.
-The root accepts these public custom properties:
-
-```css
-.my-assistant {
-  --pretty-aui-color-background: #ffffff;
-  --pretty-aui-color-surface: #f7f8fa;
-  --pretty-aui-color-surface-raised: #ffffff;
-  --pretty-aui-color-user-bubble: #edf3fe;
-  --pretty-aui-color-text: #0f1115;
-  --pretty-aui-color-text-muted: #667085;
-  --pretty-aui-color-border: #e5e7eb;
-  --pretty-aui-color-accent: #4176e6;
-  --pretty-aui-color-on-accent: #ffffff;
-  --pretty-aui-color-accent-soft: #edf3fe;
-  --pretty-aui-color-danger: #c63d4f;
-  --pretty-aui-color-warning: #a86610;
-  --pretty-aui-color-success: #24845b;
-  --pretty-aui-font-sans: ui-sans-serif, system-ui, sans-serif;
-  --pretty-aui-font-mono: ui-monospace, monospace;
-  --pretty-aui-shadow-raised:
-    0 4px 12px 0 rgb(0 0 0 / 2%), 0 2px 8px 0 rgb(0 0 0 / 4%);
-  --pretty-aui-height: 680px;
-  --pretty-aui-min-height: 420px;
-  --pretty-aui-content-max-width: 748px;
-  --pretty-aui-composer-max-width: 780px;
-  --pretty-aui-gutter: 16px;
-}
-```
-
-These properties cross the standalone Shadow DOM through the host element.
-The package supplies fallback values at consumption sites, so host values win.
-When `--pretty-aui-height: 100%` is used, the standalone mount target supplies
-the definite height; the package-owned Shadow wrapper passes it to the chat
-root and leaves outer sizing with the host.
+The same styling contract applies to React and standalone rendering. Public
+custom properties cross the standalone host into its Shadow DOM, while the host
+continues to own outer placement and sizing.

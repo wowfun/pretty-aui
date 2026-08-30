@@ -36,8 +36,9 @@ export function Assistant() {
 ```
 
 `Chat` includes the header, transcript, interactions, and composer. For custom
-assembly, tool rendering, stable data attributes, and CSS variables, see
-[Composition](docs/composition.md).
+assembly and tool rendering, see [Composition](docs/composition.md). For visual
+rules, stable data attributes, and CSS variables, see the
+[Design system](docs/design-system.md).
 
 The root `pretty-aui` entry is framework-neutral. React and React DOM are
 optional package features used only by `pretty-aui/react`; the bundled
@@ -99,22 +100,26 @@ example:
 
 ```sh
 pnpm install
-pnpm dev -- --surface inline
+pnpm dev
 ```
 
-The example uses a deterministic ACP fixture by default, so it does not need an
-agent service or credentials. Run the repository checks before submitting a
-change:
+The page uses a deterministic ACP fixture by default, so it does not need an
+agent service or credentials. It is a single Composer context playground:
+selectable context is editable before a turn and disclosed in the transcript
+after submission. The renderer adapts to the width of its host container. The
+theme controls preserve the `thoughtDelay`, `subagentDelay`, and
+`usage=extreme` diagnostics in the page URL.
+
+Run the repository checks before submitting a change:
 
 ```sh
-pnpm format:check
 pnpm check
 pnpm test:e2e
 ```
 
 `pnpm test:e2e` is the Chromium browser gate; reviewed screenshot baselines run
 only with Chromium on Linux. Firefox and WebKit are non-blocking compatibility
-signals and can be run explicitly with `pnpm test:e2e:best-effort`; they skip
+signals and can be run explicitly with `pnpm test:e2e:compat`; they skip
 `visual.spec.ts`.
 
 Run `pnpm build` after changing `src/`. The build writes the distributable files
@@ -124,15 +129,17 @@ To open the React example with a real local OpenCode session, install the
 OpenCode CLI and run:
 
 ```sh
-pnpm dev:opencode -- --surface sidebar
+pnpm dev:opencode
 ```
 
 This starts Vite and the localhost bridge, injects a short-lived random bridge
 token into the served development page, then opens the live page in your
-default browser. It does not print the token, put it in browser history, or send
-a prompt. The bridge refuses non-loopback binds and TCP peers; an explicit
-origin allowlist permits only the additional browser page origins named by the
-developer. The bridge token is not inherited by the spawned OpenCode process.
+default browser. The same Composer context playground is used, while the page
+source is fixed to OpenCode for that run. It does not print the token, put it in
+browser history, or send a prompt. The bridge refuses non-loopback binds and TCP
+peers; an explicit origin allowlist permits only the additional browser page
+origins named by the developer. The bridge token is not inherited by the
+spawned OpenCode process.
 
 ## License
 

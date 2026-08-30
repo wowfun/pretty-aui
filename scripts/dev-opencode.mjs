@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { resolve } from "node:path";
 import { createServer } from "vite";
-import { parseDevArgs, parseViteServerArgs } from "./dev-args.mjs";
+import { parseViteServerArgs } from "./dev-args.mjs";
 
 const projectRoot = resolve(import.meta.dirname, "..");
 const executable = process.env.PRETTY_AUI_OPENCODE ?? "opencode";
@@ -12,9 +12,8 @@ const bridgeToken =
   process.env.PRETTY_AUI_ACP_TOKEN ?? randomBytes(32).toString("base64url");
 const bridgeUrl = new URL(`ws://${browserHost(bridgeHost)}:${bridgePort}/acp`);
 const liveCwd = process.env.PRETTY_AUI_LIVE_CWD ?? projectRoot;
-const { surface, viteArgs } = parseDevArgs(process.argv.slice(2));
-const viteOptions = parseViteServerArgs(viteArgs);
-const livePath = `/?surface=${surface}`;
+const viteOptions = parseViteServerArgs(process.argv.slice(2));
+const livePath = "/";
 const liveConfig = {
   url: bridgeUrl.href,
   protocols: ["pretty-aui-acp", `pretty-aui-token.${bridgeToken}`],

@@ -15,6 +15,12 @@ test("connects a browser client to local OpenCode ACP", async ({
   );
   const composer = await openLivePage(page);
   await expect(composer).toBeEnabled({ timeout: 30_000 });
+  await expect(page.locator(".demo-foot")).toHaveText(
+    "Local OpenCode ACP · WebSocket",
+  );
+  await expect(
+    page.locator('[data-pretty-aui-slot="composer-context-item"]'),
+  ).toHaveCount(2);
   await expect(page.locator(".pretty-aui")).toHaveAttribute(
     "aria-label",
     "OpenCode",
@@ -146,11 +152,29 @@ async function openLivePage(page: import("@playwright/test").Page) {
 }
 
 async function selectModel(page: import("@playwright/test").Page) {
-  const model = page.locator(".paui-config select").first();
-  await expect(model.locator(`option[value="${liveModel}"]`)).toHaveCount(1, {
-    timeout: 30_000,
-  });
-  await model.selectOption(liveModel);
+  await page.waitForFunction(
+    (modelId) =>
+      window.__PRETTY_AUI__
+        ?.getSnapshot()
+        .configOptions.some(
+          (option) =>
+            option.id === "model" &&
+            option.options?.some((choice) => choice.value === modelId),
+        ),
+    liveModel,
+    { timeout: 30_000 },
+  );
+  const modelName = await page.evaluate(
+    (modelId) =>
+      window.__PRETTY_AUI__
+        ?.getSnapshot()
+        .configOptions.find((option) => option.id === "model")
+        ?.options?.find((choice) => choice.value === modelId)?.name,
+    liveModel,
+  );
+  if (!modelName) throw new Error(`Model ${liveModel} has no display name`);
+  await page.getByRole("combobox", { name: "Model" }).click();
+  await page.getByRole("option", { name: modelName, exact: true }).click();
   await page.waitForFunction(
     (modelId) =>
       window.__PRETTY_AUI__

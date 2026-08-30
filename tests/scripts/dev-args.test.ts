@@ -1,36 +1,10 @@
-import { parseDevArgs, parseViteServerArgs } from "../../scripts/dev-args.mjs";
+import { parseViteServerArgs } from "../../scripts/dev-args.mjs";
 
-describe("development arguments", () => {
-  it("defaults to inline without changing Vite arguments", () => {
-    expect(parseDevArgs(["--host", "127.0.0.1", "--port=4173"])).toEqual({
-      surface: "inline",
-      viteArgs: ["--host", "127.0.0.1", "--port=4173"],
-    });
-  });
-
-  it.each([
-    [["--surface", "inline"], "inline"],
-    [["--surface=sidebar"], "sidebar"],
-    [["--", "--surface", "sidebar"], "sidebar"],
-  ] as const)("accepts %j", (args, surface) => {
-    expect(parseDevArgs(args)).toEqual({ surface, viteArgs: [] });
-  });
-
-  it.each([
-    [[], "inline"],
-    [["--surface", "wide"], "Invalid surface"],
-    [["--surface"], "--surface requires"],
-  ] as const)("validates %j", (args, expected) => {
-    if (expected === "inline") {
-      expect(parseDevArgs(args).surface).toBe(expected);
-    } else {
-      expect(() => parseDevArgs(args)).toThrow(expected);
-    }
-  });
-
+describe("OpenCode development server arguments", () => {
   it("maps forwarded host and port arguments for the live Vite server", () => {
     expect(
       parseViteServerArgs([
+        "--",
         "--host",
         "127.0.0.1",
         "--port=4199",
@@ -43,9 +17,18 @@ describe("development arguments", () => {
     });
   });
 
-  it("rejects arguments that cannot be forwarded by dev:opencode", () => {
-    expect(() => parseViteServerArgs(["--base", "/demo/"])).toThrow(
-      "Unsupported Vite argument",
+  it.each([["--base", "/demo/"], ["--surface=sidebar"]])(
+    "rejects arguments that cannot be forwarded by dev:opencode: %j",
+    (...args) => {
+      expect(() => parseViteServerArgs(args)).toThrow(
+        "Unsupported Vite argument",
+      );
+    },
+  );
+
+  it("validates the forwarded Vite port", () => {
+    expect(() => parseViteServerArgs(["--port", "70000"])).toThrow(
+      "Invalid Vite port",
     );
   });
 });

@@ -42,7 +42,7 @@ jobs:
           react18_lock_dir="$(mktemp -d "$RUNNER_TEMP/pretty-aui-react18.XXXXXX")"
           cp pnpm-lock.yaml "$react18_lock_dir/pnpm-lock.yaml"
           pnpm --lockfile-dir="$react18_lock_dir" add --save-dev --save-exact react@18.3.1 react-dom@18.3.1 @types/react@18.3.31 @types/react-dom@18.3.7
-      - run: pnpm typecheck
+      - run: pnpm check:types
       - run: pnpm test
 
   coverage:
@@ -96,4 +96,4 @@ jobs:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
       - run: pnpm exec playwright install --with-deps firefox webkit
-      - run: pnpm test:e2e:best-effort
+      - run: pnpm test:e2e:compat

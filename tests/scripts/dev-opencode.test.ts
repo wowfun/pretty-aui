@@ -31,10 +31,11 @@ describe("OpenCode development command", () => {
     );
 
     const output = await waitForOutput(child, "pretty-aui OpenCode ready:");
-    expect(output).toContain(`http://127.0.0.1:${vitePort}/?surface=inline`);
+    expect(output).toContain(`http://127.0.0.1:${vitePort}/`);
     expect(output).not.toContain(bridgeToken);
     expect(output).not.toContain("live=");
-    const page = await fetch(`http://127.0.0.1:${vitePort}/?surface=inline`);
+    expect(output).not.toContain("cwd=");
+    const page = await fetch(`http://127.0.0.1:${vitePort}/`);
     const html = await page.text();
     expect(html).toContain(bridgeToken);
     expect(html).toContain("pretty-aui-token.");
@@ -64,26 +65,18 @@ describe("OpenCode development command", () => {
     await expect(waitForExit(child)).resolves.toMatchObject({ code: 0 });
   });
 
-  it("forwards sidebar, host, and port to the live page server", async () => {
+  it("forwards host and port to the live page server", async () => {
     const [bridgePort, vitePort] = await unusedPorts(2);
     const child = startDev(
       {
         PRETTY_AUI_ACP_PORT: String(bridgePort),
         PRETTY_AUI_OPENCODE: process.execPath,
       },
-      [
-        "--surface",
-        "sidebar",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        String(vitePort),
-        "--strictPort",
-      ],
+      ["--host", "127.0.0.1", "--port", String(vitePort), "--strictPort"],
     );
 
     const output = await waitForOutput(child, "pretty-aui OpenCode ready:");
-    expect(output).toContain(`http://127.0.0.1:${vitePort}/?surface=sidebar`);
+    expect(output).toContain(`http://127.0.0.1:${vitePort}/`);
     expect(output).not.toContain("live=");
 
     child.kill("SIGTERM");
@@ -141,7 +134,7 @@ describe("OpenCode development command", () => {
     );
 
     const output = await waitForOutput(child, "pretty-aui OpenCode ready:");
-    expect(output).toContain(`http://127.0.0.1:${vitePort}/?surface=inline`);
+    expect(output).toContain(`http://127.0.0.1:${vitePort}/`);
 
     child.kill("SIGTERM");
     await expect(waitForExit(child)).resolves.toMatchObject({ code: 0 });

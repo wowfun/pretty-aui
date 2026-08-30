@@ -1,35 +1,11 @@
-const SURFACES = new Set(["inline", "sidebar"]);
-
-/** Removes pretty-aui arguments and leaves Vite arguments in their original order. */
-export function parseDevArgs(args) {
-  let surface = "inline";
-  const viteArgs = [];
-  for (let index = 0; index < args.length; index += 1) {
-    const argument = args[index];
-    if (argument === "--") {
-      continue;
-    } else if (argument === "--surface") {
-      const value = args[index + 1];
-      if (!value || value.startsWith("--")) {
-        throw new Error("--surface requires inline or sidebar");
-      }
-      surface = parseSurface(value);
-      index += 1;
-    } else if (argument?.startsWith("--surface=")) {
-      surface = parseSurface(argument.slice("--surface=".length));
-    } else if (argument !== undefined) {
-      viteArgs.push(argument);
-    }
-  }
-  return { surface, viteArgs };
-}
-
 /** Extracts the Vite server options used by the programmatic live command. */
 export function parseViteServerArgs(args) {
   const server = {};
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
-    if (argument === "--host") {
+    if (argument === "--") {
+      continue;
+    } else if (argument === "--host") {
       const value = args[index + 1];
       if (value && !value.startsWith("--")) {
         server.host = value;
@@ -55,13 +31,6 @@ export function parseViteServerArgs(args) {
     }
   }
   return { server, force: args.includes("--force") };
-}
-
-function parseSurface(value) {
-  if (!SURFACES.has(value)) {
-    throw new Error(`Invalid surface: ${value}. Expected inline or sidebar.`);
-  }
-  return value;
 }
 
 function parseVitePort(value) {

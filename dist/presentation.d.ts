@@ -35,6 +35,7 @@ export interface ChatLabels {
     readonly historyGap: string;
     readonly historyGapTitle: string;
     readonly loadMore: string;
+    readonly mode: string;
     readonly newChat: string;
     readonly noSessions: string;
     readonly openLink: string;

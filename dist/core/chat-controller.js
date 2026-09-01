@@ -13,6 +13,7 @@ const NO_CAPABILITIES = {
 };
 const MAX_MODEL_PREFERENCE_LENGTH = 16 * 1024;
 const MAX_NOTICE_LENGTH = 16 * 1024;
+const MAX_CONTEXT_FAILURE_DETAIL_LENGTH = 1_024;
 /**
  * Creates a framework-neutral chat controller and starts ACP initialization.
  *
@@ -48,12 +49,16 @@ class DefaultChatController {
     #connectionError;
     #sessionTrail = [];
     #modelPreference;
+    #newSessionMode;
     #newSessionMutation;
     #sessionMutations = new Map();
     #sessionListRequest;
+    #sessionTitleRefresh;
+    #sessionTitleRefreshRequested = false;
     constructor(options) {
         this.#options = options;
         this.#modelPreference = this.#readModelPreference();
+        this.#newSessionMode = this.#readNewSessionMode();
         this.#contextSelection = readContextSelection(options.context);
         this.#snapshot = {
             phase: "connecting",
@@ -247,6 +252,7 @@ class DefaultChatController {
                         ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
                     }
                     : page;
+                this.#reconcileCatalogTitles(sessions.sessions);
                 this.#snapshot = cleanSnapshot({ ...this.#snapshot, sessions });
                 this.#publish();
                 return sessions;
@@ -656,6 +662,7 @@ class DefaultChatController {
                         configOptions: oldSession.configOptions,
                         commands: oldSession.commands,
                         sessionTitle: oldSession.sessionTitle,
+                        sessionTitleSource: oldSession.sessionTitleSource,
                     };
                     this.#staging.set(oldSession.sessionId, staging);
                     const restored = await driver.openSession(oldSession.sessionId, this.#options.session, history);
@@ -817,7 +824,7 @@ class DefaultChatController {
         catch (error) {
             if (signal.aborted)
                 throw signal.reason ?? error;
-            throw new PrettyAuiError("CONTEXT_FAILED", "Context could not be prepared; the prompt was not sent", {
+            throw new PrettyAuiError("CONTEXT_FAILED", contextFailureMessage(error), {
                 cause: error,
                 protocol: this.#driver?.version,
                 phase: "context",
@@ -832,6 +839,7 @@ class DefaultChatController {
             configOptions: [],
             commands: [],
             sessionTitle: undefined,
+            sessionTitleSource: undefined,
         };
         this.#staging.set(sessionId, staging);
         try {
@@ -852,8 +860,9 @@ class DefaultChatController {
         }
     }
     async #newSession(driver) {
-        const session = await driver.newSession(this.#options.session);
+        let session = await driver.newSession(this.#options.session);
         this.#assertDriverCurrent(driver);
+        session = await this.#applyNewSessionMode(driver, session);
         const model = findModelOption(session.configOptions);
         const preferred = this.#modelPreference;
         if (!model ||
@@ -865,14 +874,7 @@ class DefaultChatController {
         try {
             const returned = await driver.setConfigOption(session.sessionId, model.id, preferred);
             this.#assertDriverCurrent(driver);
-            return {
-                ...session,
-                configOptions: returned.length
-                    ? returned
-                    : session.configOptions.map((option) => option.id === model.id
-                        ? { ...option, currentValue: preferred }
-                        : option),
-            };
+            return updateSessionConfigOption(session, model, preferred, returned);
         }
         catch (error) {
             this.#assertDriverCurrent(driver);
@@ -883,6 +885,33 @@ class DefaultChatController {
                 sessionId: session.sessionId,
                 code: "MODEL_PREFERENCE_APPLY_FAILED",
                 message: "The preferred model could not be applied; using the Agent default",
+            });
+            return session;
+        }
+    }
+    async #applyNewSessionMode(driver, session) {
+        const mode = findModeOption(session.configOptions);
+        const preferred = this.#newSessionMode;
+        if (!mode ||
+            !preferred ||
+            mode.currentValue === preferred ||
+            !mode.options?.some((option) => option.value === preferred)) {
+            return session;
+        }
+        try {
+            const returned = await driver.setConfigOption(session.sessionId, mode.id, preferred);
+            this.#assertDriverCurrent(driver);
+            return updateSessionConfigOption(session, mode, preferred, returned);
+        }
+        catch (error) {
+            this.#assertDriverCurrent(driver);
+            if (this.#connectionPhase === "error")
+                throw connectionClosedError();
+            this.#emit({
+                type: "diagnostic",
+                sessionId: session.sessionId,
+                code: "NEW_SESSION_MODE_APPLY_FAILED",
+                message: "The fixed new-session mode could not be applied; using the Agent default",
             });
             return session;
         }
@@ -921,6 +950,7 @@ class DefaultChatController {
             session.configOptions = effect.configOptions;
         if (effect.sessionTitle !== undefined) {
             session.sessionTitle = effect.sessionTitle ?? undefined;
+            session.sessionTitleSource = "notification";
             summaryChanged = true;
         }
         if (effect.usage)
@@ -951,8 +981,10 @@ class DefaultChatController {
             staging.commands = effect.commands;
         if (effect.configOptions)
             staging.configOptions = effect.configOptions;
-        if (effect.sessionTitle !== undefined)
+        if (effect.sessionTitle !== undefined) {
             staging.sessionTitle = effect.sessionTitle ?? undefined;
+            staging.sessionTitleSource = "notification";
+        }
         this.#emitTimelineDiagnostics(staging.sessionId, effect);
     }
     #emitTimelineDiagnostics(sessionId, effect) {
@@ -1129,6 +1161,11 @@ class DefaultChatController {
         return session;
     }
     #createSession(session, timeline = new TimelineStore(), staging, instanceId = `session-instance-${++this.#sessionInstanceCounter}`) {
+        const catalogTitle = this.#snapshot.sessions?.sessions.find((candidate) => candidate.sessionId === session.sessionId)?.title;
+        const notificationTitle = staging?.sessionTitleSource === "notification";
+        const sessionTitle = notificationTitle
+            ? staging?.sessionTitle
+            : (staging?.sessionTitle ?? catalogTitle);
         const managed = {
             sessionId: session.sessionId,
             instanceId,
@@ -1140,7 +1177,12 @@ class DefaultChatController {
                 : (staging?.configOptions ?? []),
             commands: staging?.commands ?? session.commands ?? [],
             interactions: [],
-            sessionTitle: staging?.sessionTitle,
+            sessionTitle,
+            sessionTitleSource: notificationTitle
+                ? "notification"
+                : sessionTitle !== undefined
+                    ? "catalog"
+                    : undefined,
             historyGap: session.historyGap ?? false,
             usage: undefined,
             stopReason: undefined,
@@ -1160,6 +1202,10 @@ class DefaultChatController {
         });
         this.#publish();
         this.#emit({ type: "session_changed", sessionId: session.sessionId });
+        if (session.sessionTitle === undefined &&
+            session.sessionTitleSource !== "notification") {
+            this.#queueSessionTitleRefresh();
+        }
     }
     #clearSelection() {
         this.#sessionTrail = [];
@@ -1220,6 +1266,19 @@ class DefaultChatController {
             type: "diagnostic",
             code: "INVALID_MODEL_PREFERENCE",
             message: "Ignored an invalid host model preference",
+        });
+        return undefined;
+    }
+    #readNewSessionMode() {
+        const value = this.#options.newSessionMode;
+        if (value === undefined)
+            return undefined;
+        if (validConfigValue(value))
+            return value;
+        this.#emit({
+            type: "diagnostic",
+            code: "INVALID_NEW_SESSION_MODE",
+            message: "Ignored an invalid fixed new-session mode",
         });
         return undefined;
     }
@@ -1353,7 +1412,75 @@ class DefaultChatController {
             turnId: turn.id,
             stopReason,
         });
+        if (stopReason !== "cancelled" &&
+            session.sessionTitleSource !== "notification") {
+            this.#queueSessionTitleRefresh();
+        }
         return { stopReason };
+    }
+    #reconcileCatalogTitles(sessions) {
+        for (const catalog of sessions) {
+            if (catalog.title === undefined)
+                continue;
+            const loaded = this.#sessions.get(catalog.sessionId);
+            if (!loaded || loaded.sessionTitleSource === "notification")
+                continue;
+            loaded.sessionTitle = catalog.title;
+            loaded.sessionTitleSource = "catalog";
+        }
+    }
+    #queueSessionTitleRefresh() {
+        if (this.#destroyed ||
+            !this.#snapshot.capabilities.listSessions ||
+            !this.#driver) {
+            return;
+        }
+        this.#sessionTitleRefreshRequested = true;
+        if (this.#sessionTitleRefresh)
+            return;
+        const driver = this.#driver;
+        const operation = Promise.resolve()
+            .then(async () => {
+            while (this.#sessionTitleRefreshRequested && !this.#destroyed) {
+                this.#sessionTitleRefreshRequested = false;
+                const active = this.#sessionListRequest;
+                let firstPageSatisfied = false;
+                if (active) {
+                    try {
+                        await active.operation;
+                        firstPageSatisfied = active.cursor === undefined;
+                    }
+                    catch {
+                        // The best-effort refresh gets one independent first-page try.
+                    }
+                }
+                if (this.#destroyed || this.#driver !== driver)
+                    return;
+                if (firstPageSatisfied)
+                    continue;
+                try {
+                    await this.listSessions();
+                }
+                catch {
+                    if (this.#destroyed || this.#driver !== driver)
+                        return;
+                    this.#emit({
+                        type: "diagnostic",
+                        code: "SESSION_TITLE_REFRESH_FAILED",
+                        message: "The session title could not be refreshed from the Agent catalog",
+                    });
+                }
+            }
+        })
+            .finally(() => {
+            if (this.#sessionTitleRefresh !== operation)
+                return;
+            this.#sessionTitleRefresh = undefined;
+            if (this.#sessionTitleRefreshRequested) {
+                this.#queueSessionTitleRefresh();
+            }
+        });
+        this.#sessionTitleRefresh = operation;
     }
     async #withNewSessionOperation(phase, operation) {
         if (this.#destroyed)
@@ -1580,7 +1707,39 @@ function findModelOption(options) {
     return (options.find((option) => option.category === "model" && option.type === "select") ??
         options.find((option) => option.id === "model" && option.type === "select"));
 }
+function contextFailureMessage(error) {
+    const summary = "Context could not be prepared; the prompt was not sent";
+    if (!(error instanceof Error))
+        return summary;
+    const detail = error.message.trim();
+    if (!detail)
+        return summary;
+    let bounded = detail.slice(0, MAX_CONTEXT_FAILURE_DETAIL_LENGTH);
+    const trailing = bounded.charCodeAt(bounded.length - 1);
+    if (trailing >= 0xd800 && trailing <= 0xdbff)
+        bounded = bounded.slice(0, -1);
+    if (detail.length > MAX_CONTEXT_FAILURE_DETAIL_LENGTH)
+        bounded += "…";
+    return `${summary}: ${bounded}`;
+}
+function findModeOption(options) {
+    return (options.find((option) => option.category === "mode" && option.type === "select") ??
+        options.find((option) => option.id === "mode" && option.type === "select"));
+}
+function updateSessionConfigOption(session, option, value, returned) {
+    return {
+        ...session,
+        configOptions: returned.length
+            ? returned
+            : session.configOptions.map((candidate) => candidate.id === option.id
+                ? { ...candidate, currentValue: value }
+                : candidate),
+    };
+}
 function validModelPreference(value) {
+    return validConfigValue(value);
+}
+function validConfigValue(value) {
     return (typeof value === "string" &&
         value.length > 0 &&
         utf8StringWithinBudget(value, MAX_MODEL_PREFERENCE_LENGTH));

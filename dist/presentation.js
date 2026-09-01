@@ -31,6 +31,7 @@ export const defaultLabels = {
     historyGap: "Earlier messages are unavailable for this session.",
     historyGapTitle: "Partial history",
     loadMore: "Load more",
+    mode: "Mode",
     newChat: "New chat",
     noSessions: "No previous sessions",
     openLink: "Open link",

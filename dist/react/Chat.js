@@ -640,6 +640,8 @@ export function ChatComposer() {
     const [commandsDismissed, setCommandsDismissed] = useState(false);
     const composingRef = useRef(false);
     const textareaRef = useRef(null);
+    const composerCardRef = useRef(null);
+    const commandsRef = useRef(null);
     const sessionKey = sessionCacheKey(snapshot);
     const sessionRef = useRef(sessionKey);
     const draftsRef = useRef(new Map());
@@ -701,9 +703,7 @@ export function ChatComposer() {
         }
     };
     const matchingCommands = value.startsWith("/") && !/\s/.test(value.slice(1)) && !commandsDismissed
-        ? snapshot.commands
-            .filter((command) => command.name.startsWith(value.slice(1).split(/\s/, 1)[0] ?? ""))
-            .slice(0, 5)
+        ? snapshot.commands.filter((command) => command.name.startsWith(value.slice(1).split(/\s/, 1)[0] ?? ""))
         : [];
     const selectedCommandIndex = Math.min(commandIndex, Math.max(0, matchingCommands.length - 1));
     const chooseCommand = (name) => {
@@ -732,6 +732,13 @@ export function ChatComposer() {
             setCommandsDismissed(true);
             return;
         }
+        if (matchingCommands.length && event.key === "Tab" && !event.shiftKey) {
+            event.preventDefault();
+            const command = matchingCommands[selectedCommandIndex];
+            if (command)
+                chooseCommand(command.name);
+            return;
+        }
         if (event.key === "Enter" &&
             !event.shiftKey &&
             !composingRef.current &&
@@ -745,7 +752,49 @@ export function ChatComposer() {
         }
     };
     const commandsId = `${ids.instance}-commands`;
-    return (_jsxs("footer", { className: "paui-composer-wrap", "data-pretty-aui-slot": "composer", "data-placement": placement, children: [matchingCommands.length ? (_jsx("div", { className: "paui-commands", role: "listbox", id: commandsId, "aria-label": labels.commands, children: matchingCommands.map((command, index) => (_jsxs("button", { type: "button", id: `${commandsId}-${index}`, role: "option", "aria-selected": index === selectedCommandIndex, onMouseDown: (event) => event.preventDefault(), onClick: () => chooseCommand(command.name), children: [_jsxs("code", { children: ["/", command.name] }), _jsx("span", { children: command.description })] }, command.name))) })) : null, _jsxs("div", { className: "paui-composer", "data-pretty-aui-slot": "composer-input", children: [snapshot.contextSelection.items.length ||
+    useLayoutEffect(() => {
+        const listbox = commandsRef.current;
+        const composer = composerCardRef.current;
+        const root = listbox?.closest(".pretty-aui");
+        if (!listbox || !composer || !root)
+            return;
+        const updateHeight = () => {
+            const available = composer.getBoundingClientRect().top -
+                root.getBoundingClientRect().top -
+                8;
+            listbox.style.maxHeight = `${Math.max(48, Math.min(320, Math.floor(available)))}px`;
+        };
+        updateHeight();
+        const observer = globalThis.ResizeObserver
+            ? new ResizeObserver(updateHeight)
+            : undefined;
+        observer?.observe(root);
+        observer?.observe(composer);
+        globalThis.addEventListener?.("resize", updateHeight);
+        return () => {
+            observer?.disconnect();
+            globalThis.removeEventListener?.("resize", updateHeight);
+        };
+    }, [
+        matchingCommands.length,
+        placement,
+        snapshot.contextSelection.items.length,
+    ]);
+    useLayoutEffect(() => {
+        const listbox = commandsRef.current;
+        const option = listbox?.querySelector(`#${commandsId}-${selectedCommandIndex}`);
+        if (!listbox || !option)
+            return;
+        if (option.offsetTop < listbox.scrollTop) {
+            listbox.scrollTop = option.offsetTop;
+        }
+        else if (option.offsetTop + option.offsetHeight >
+            listbox.scrollTop + listbox.clientHeight) {
+            listbox.scrollTop =
+                option.offsetTop + option.offsetHeight - listbox.clientHeight;
+        }
+    }, [commandsId, matchingCommands.length, selectedCommandIndex]);
+    return (_jsxs("footer", { className: "paui-composer-wrap", "data-pretty-aui-slot": "composer", "data-placement": placement, children: [matchingCommands.length ? (_jsx("div", { ref: commandsRef, className: "paui-commands", role: "listbox", id: commandsId, "aria-label": labels.commands, children: matchingCommands.map((command, index) => (_jsxs("button", { type: "button", id: `${commandsId}-${index}`, role: "option", "aria-selected": index === selectedCommandIndex, onMouseDown: (event) => event.preventDefault(), onClick: () => chooseCommand(command.name), children: [_jsxs("code", { children: ["/", command.name] }), _jsx("span", { children: command.description })] }, command.name))) })) : null, _jsxs("div", { ref: composerCardRef, className: "paui-composer", "data-pretty-aui-slot": "composer-input", children: [snapshot.contextSelection.items.length ||
                         snapshot.contextSelection.canAdd ? (_jsxs("div", { className: "paui-composer__context", "data-pretty-aui-slot": "composer-context", role: "group", "aria-label": labels.contextSelection, children: [snapshot.contextSelection.canAdd ? (_jsx("button", { className: "paui-context-add", type: "button", "aria-label": labels.addContext, title: labels.addContext, disabled: disabled || running || snapshot.contextSelection.busy, onMouseDown: (event) => event.preventDefault(), onClick: () => runAction(() => controller.addContext()), children: _jsx("span", { "aria-hidden": "true", children: "+" }) })) : null, snapshot.contextSelection.items.map((item) => (_jsxs("span", { className: "paui-context-chip", "data-pretty-aui-slot": "composer-context-item", title: item.label, children: [_jsx("span", { className: "paui-context-chip__label", children: item.label }), snapshot.contextSelection.canRemove ? (_jsx("button", { type: "button", "aria-label": labels.removeContext(item.label), title: labels.removeContext(item.label), disabled: disabled || running || snapshot.contextSelection.busy, onMouseDown: (event) => event.preventDefault(), onClick: () => runAction(() => controller.removeContext(item.id)), children: _jsx("span", { "aria-hidden": "true", children: "\u00D7" }) })) : null] }, item.id)))] })) : null, _jsx("textarea", { ref: textareaRef, rows: 1, value: value, disabled: disabled, placeholder: labels.composerPlaceholder, "aria-label": labels.composerPlaceholder, role: "combobox", "aria-autocomplete": "list", "aria-haspopup": "listbox", "aria-controls": matchingCommands.length ? commandsId : undefined, "aria-expanded": Boolean(matchingCommands.length), "aria-activedescendant": matchingCommands.length
                             ? `${commandsId}-${selectedCommandIndex}`
                             : undefined, onInput: (event) => {
@@ -761,10 +810,13 @@ export function ChatComposer() {
                         }, onKeyDown: onKeyDown }), _jsxs("div", { className: "paui-composer__actions", "data-pretty-aui-slot": "composer-actions", children: [snapshot.configOptions.length ? (_jsx(ConfigBar, { controller: controller, options: snapshot.configOptions })) : (_jsx("span", {})), running ? (_jsxs("button", { className: "paui-send paui-stop", type: "button", onMouseDown: (event) => event.preventDefault(), onClick: () => runAction(() => controller.cancel()), disabled: snapshot.phase === "cancelling", children: [_jsx(StopIcon, {}), _jsx("span", { className: "paui-sr-only", children: labels.stop })] })) : (_jsxs("button", { className: "paui-send", type: "button", onMouseDown: (event) => event.preventDefault(), onClick: submit, disabled: disabled || !value.trim(), children: [_jsx(SendIcon, {}), _jsx("span", { className: "paui-sr-only", children: labels.send })] }))] })] })] }));
 }
 function ConfigBar({ controller, options, }) {
-    const { runAction } = useChatContext("ChatComposer");
-    return (_jsx("div", { className: "paui-config", children: options.map((option) => option.type === "boolean" ? (_jsxs("label", { title: option.description, children: [_jsx("input", { type: "checkbox", checked: Boolean(option.currentValue), onChange: (event) => runAction(() => controller.setConfigOption(option.id, event.target.checked)) }), _jsx("span", { children: option.name })] }, option.id)) : option.type === "select" ? (_jsx(ConfigSelect, { controller: controller, option: option }, option.id)) : null) }));
+    const { labels, runAction } = useChatContext("ChatComposer");
+    return (_jsx("div", { className: "paui-config", children: options.map((option) => {
+            const label = configOptionLabel(option, labels);
+            return option.type === "boolean" ? (_jsxs("label", { title: option.description, children: [_jsx("input", { type: "checkbox", checked: Boolean(option.currentValue), onChange: (event) => runAction(() => controller.setConfigOption(option.id, event.target.checked)) }), _jsx("span", { children: label })] }, option.id)) : option.type === "select" ? (_jsx(ConfigSelect, { controller: controller, label: label, option: option }, option.id)) : null;
+        }) }));
 }
-function ConfigSelect({ controller, option, }) {
+function ConfigSelect({ controller, label, option, }) {
     const { runAction } = useChatContext("ChatComposer");
     const rootRef = useRef(null);
     const triggerRef = useRef(null);
@@ -857,7 +909,12 @@ function ConfigSelect({ controller, option, }) {
         if (event.key === "Tab")
             closeList();
     };
-    return (_jsxs("div", { className: "paui-config__field", ref: rootRef, children: [_jsxs("button", { ref: triggerRef, className: "paui-config__trigger", type: "button", role: "combobox", "aria-label": option.name, "aria-controls": open ? listboxId : undefined, "aria-expanded": open, "aria-haspopup": "listbox", "aria-activedescendant": open ? `${listboxId}-option-${activeIndex}` : undefined, title: option.description, disabled: !choices.length, onClick: () => (open ? closeList() : openList()), onKeyDown: onKeyDown, children: [_jsx("span", { children: selected?.name ?? String(option.currentValue) }), _jsx(ChevronIcon, {})] }), open ? (_jsx("div", { ref: listboxRef, className: "paui-config__listbox", id: listboxId, role: "listbox", "aria-label": option.name, children: choices.map((choice, index) => (_jsxs("button", { id: `${listboxId}-option-${index}`, className: "paui-config__option", type: "button", role: "option", "aria-selected": choice.value === String(option.currentValue), "data-active": index === activeIndex || undefined, title: choice.description, tabIndex: -1, onMouseMove: index === activeIndex ? undefined : () => setActiveIndex(index), onMouseDown: (event) => event.preventDefault(), onClick: () => choose(index), children: [_jsx("span", { children: choice.name }), _jsx("span", { className: "paui-config__check", "aria-hidden": "true", children: choice.value === String(option.currentValue) ? (_jsx(ConfigCheckIcon, {})) : null })] }, choice.value))) })) : null] }));
+    return (_jsxs("div", { className: "paui-config__field", ref: rootRef, children: [_jsxs("button", { ref: triggerRef, className: "paui-config__trigger", type: "button", role: "combobox", "aria-label": label, "aria-controls": open ? listboxId : undefined, "aria-expanded": open, "aria-haspopup": "listbox", "aria-activedescendant": open ? `${listboxId}-option-${activeIndex}` : undefined, title: option.description, disabled: !choices.length, onClick: () => (open ? closeList() : openList()), onKeyDown: onKeyDown, children: [_jsx("span", { children: selected?.name ?? String(option.currentValue) }), _jsx(ChevronIcon, {})] }), open ? (_jsx("div", { ref: listboxRef, className: "paui-config__listbox", id: listboxId, role: "listbox", "aria-label": label, children: choices.map((choice, index) => (_jsxs("button", { id: `${listboxId}-option-${index}`, className: "paui-config__option", type: "button", role: "option", "aria-selected": choice.value === String(option.currentValue), "data-active": index === activeIndex || undefined, title: choice.description, tabIndex: -1, onMouseMove: index === activeIndex ? undefined : () => setActiveIndex(index), onMouseDown: (event) => event.preventDefault(), onClick: () => choose(index), children: [_jsx("span", { children: choice.name }), _jsx("span", { className: "paui-config__check", "aria-hidden": "true", children: choice.value === String(option.currentValue) ? (_jsx(ConfigCheckIcon, {})) : null })] }, choice.value))) })) : null] }));
+}
+function configOptionLabel(option, labels) {
+    return option.category === "mode" || option.id === "mode"
+        ? labels.mode
+        : option.name;
 }
 function PermissionCard({ interaction, controller, labels, }) {
     const { ids } = useChatContext("ChatInteractions");
@@ -1178,6 +1235,10 @@ const markdownRenderer = new Renderer();
 markdownRenderer.html = ({ text }) => escapeHtml(text);
 markdownRenderer.image = ({ text }) => `<span class="paui-markdown-image-alt">${escapeHtml(text)}</span>`;
 markdownRenderer.checkbox = ({ checked }) => (checked ? "[x] " : "[ ] ");
+markdownRenderer.table = function (token) {
+    const table = Renderer.prototype.table.call(this, token);
+    return `<div class="paui-markdown-table">${table}</div>`;
+};
 markdownRenderer.link = ({ href, title, tokens }) => {
     const content = escapeHtml(tokens.map((token) => token.raw).join(""));
     if (!safeUrl(href))

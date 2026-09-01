@@ -169,6 +169,14 @@ Images stay within the transcript width and a bounded height. Markdown,
 terminal output, diffs, and literal resources own their overflow rather than
 widening the root.
 
+GitHub Flavored Markdown tables retain semantic table, header, body, row, and
+cell elements. A package-owned wrapper gives each table its own horizontal
+scrolling region. Short tables fill the available message width; wide tables
+keep their column geometry and scroll inside that wrapper without widening the
+transcript or chat root. Header cells use the neutral surface and all cells use
+the shared border, text, and spacing tokens. Markdown alignment remains visible
+through the table cells rather than being replaced by a package-wide alignment.
+
 ### Activity rows
 
 Reasoning, tools, plans, context, host notices, and subagent work share a compact flow-row
@@ -218,7 +226,12 @@ the text color, adding decoration, or restoring a control frame. Their raised
 listboxes use the same neutral text and selection surfaces, no visible frame,
 and a thin muted scrollbar. The composer uses elevation rather than a visible
 border and does not recolor its frame when focus moves among its controls.
-The command list uses the same raised surface and width as the composer.
+The command list uses the same raised surface and width as the composer. It
+shows every normalized command that matches the current slash prefix. Its
+height is bounded by the space above the composer and becomes independently
+scrollable instead of dropping later matches or escaping the chat root. Moving
+the active option with the keyboard keeps that option visible and gives it the
+same neutral selection fill used for pointer hover.
 
 ### Drawers and overlays
 

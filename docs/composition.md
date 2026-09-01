@@ -51,13 +51,22 @@ the store's scope and durability. Existing or reopened sessions retain their
 own Agent configuration; selecting one only makes its current model the
 preference for later new sessions.
 
+Pass `newSessionMode` when every genuinely new session should start in one
+fixed Agent-advertised mode. The controller recognizes the ACP `mode` category,
+with the conventional `mode` option ID as a fallback, and applies the value
+before publishing the new session. Existing, reopened, and restored sessions
+retain their Agent-owned mode. An unavailable value leaves the new session in
+the Agent default; a failed request additionally emits a non-fatal diagnostic.
+
 Composer configuration renders the complete option set published by the Agent.
 Selecting a value applies it through the controller while keeping the remaining
 choices available for a later change. Select configuration uses a package-owned
 listbox so its presentation is themeable across browsers. The trigger retains
 focus while Arrow keys move the active option; Enter or Space commits it,
 Escape closes without changing it, and pointer selection returns focus to the
-trigger.
+trigger. A host `labels.mode` override replaces the presentation label for the
+normalized `mode` category (or conventional `mode` option ID); Agent-owned
+choice names and all other configuration names remain unchanged.
 
 Call `controller.appendNotice({ text, level, sessionId? })` when a host-owned
 status belongs in one loaded transcript. Omitting `sessionId` targets the active
@@ -134,6 +143,9 @@ crowded surfaces. They describe only the next-turn selection: sending freezes
 that ordered selection, and later add or remove operations do not rewrite prior
 activities. Stable slots expose the selection as `composer-context` and each
 chip as `composer-context-item`; submitted activities remain `data-kind="context"`.
+If resolution fails, no prompt is sent and `CONTEXT_FAILED` retains a bounded
+provider error message after the package-owned summary so the host can present
+an actionable reason.
 
 An OpenCode task reported as a `think` tool is presented as a distinct Agent
 row when its normalized input contains `subagent_type` plus a task description
@@ -157,7 +169,11 @@ The built-in session drawer traps keyboard focus while modal and restores focus
 to its opener when closed. A session action menu moves focus to its action;
 Escape closes the menu and restores its trigger before Escape can close the
 drawer. Command suggestions use listbox semantics and can be selected from the
-composer with Up, Down, Enter, or Escape. Once arguments have started, Enter
+composer with Up, Down, Enter, Tab, or Escape. Enter and Tab complete the active
+suggestion while the list is open; Shift+Tab keeps native reverse focus
+navigation. Every normalized prefix match remains
+available through the listbox's bounded scroll region, and keyboard movement
+scrolls the active option into view. Once arguments have started, Enter
 submits the complete slash command instead of reselecting its name. Blocking
 permission and elicitation cards move focus to their first available control,
 and the transcript itself is keyboard-scrollable. Streaming status is announced

@@ -65,7 +65,14 @@ keep their Agent-owned configuration and are never overwritten by the
 preference. Session operations are single-flight per target, and connection
 replacement is single-flight for the whole controller. Concurrent session-list
 reads for the same cursor share one request; a different cursor remains busy so
-pagination cannot commit out of order. Unknown-session updates are diagnosed
+pagination cannot commit out of order. Session title notifications are
+authoritative for their loaded record, including an explicit cleared title.
+For Agents that expose titles only through `session/list`, catalog results seed
+and update records that have not received a title notification. Selecting an
+untitled record and completing a non-cancelled turn schedule a coalesced,
+best-effort first-page refresh; it waits behind explicit pagination, never
+changes a successful turn into an error, and never lets a catalog value
+overwrite a notified title. Unknown-session updates are diagnosed
 without allocating state. Permission requests remain with their owning session
 and surface a background badge rather than stealing the active selection. URL
 elicitation completion is correlated by the agent-provided elicitation identity
@@ -84,10 +91,11 @@ v1 agents. Failure to restore the selected session fails the connection
 replacement; failure to restore a background session marks only that record as
 failed. An agent exposing neither capability receives one genuinely fresh
 session and the prior loaded records are discarded rather than relabeled. Every
-fresh-session path applies a compatible preferred model before publishing the
-new selection. A missing model, an unavailable saved value, or a failing
-best-effort preference adapter falls back to the Agent default without making
-the session unusable.
+fresh-session path applies a compatible fixed host mode and then a preferred
+model before publishing the new selection. The fixed mode never changes an
+opened or restored session and is not learned from a previous session. A missing
+mode or model, an unavailable value, or a failing best-effort configuration
+request falls back to the Agent default without making the session unusable.
 The package root, `./core`, and `./standalone` entries are React-free;
 `./react` is the only entry whose interface requires the optional React peers.
 Borrowed-controller rendering supports SSR from the controller's current

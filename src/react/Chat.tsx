@@ -1562,6 +1562,8 @@ export function ChatComposer() {
   const [commandsDismissed, setCommandsDismissed] = useState(false);
   const composingRef = useRef(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const composerCardRef = useRef<HTMLDivElement>(null);
+  const commandsRef = useRef<HTMLDivElement>(null);
   const sessionKey = sessionCacheKey(snapshot);
   const sessionRef = useRef(sessionKey);
   const draftsRef = useRef(new Map<string | undefined, string>());
@@ -1622,11 +1624,9 @@ export function ChatComposer() {
   };
   const matchingCommands =
     value.startsWith("/") && !/\s/.test(value.slice(1)) && !commandsDismissed
-      ? snapshot.commands
-          .filter((command) =>
-            command.name.startsWith(value.slice(1).split(/\s/, 1)[0] ?? ""),
-          )
-          .slice(0, 5)
+      ? snapshot.commands.filter((command) =>
+          command.name.startsWith(value.slice(1).split(/\s/, 1)[0] ?? ""),
+        )
       : [];
   const selectedCommandIndex = Math.min(
     commandIndex,
@@ -1659,6 +1659,12 @@ export function ChatComposer() {
       setCommandsDismissed(true);
       return;
     }
+    if (matchingCommands.length && event.key === "Tab" && !event.shiftKey) {
+      event.preventDefault();
+      const command = matchingCommands[selectedCommandIndex];
+      if (command) chooseCommand(command.name);
+      return;
+    }
     if (
       event.key === "Enter" &&
       !event.shiftKey &&
@@ -1672,6 +1678,50 @@ export function ChatComposer() {
     }
   };
   const commandsId = `${ids.instance}-commands`;
+  useLayoutEffect(() => {
+    const listbox = commandsRef.current;
+    const composer = composerCardRef.current;
+    const root = listbox?.closest<HTMLElement>(".pretty-aui");
+    if (!listbox || !composer || !root) return;
+    const updateHeight = () => {
+      const available =
+        composer.getBoundingClientRect().top -
+        root.getBoundingClientRect().top -
+        8;
+      listbox.style.maxHeight = `${Math.max(48, Math.min(320, Math.floor(available)))}px`;
+    };
+    updateHeight();
+    const observer = globalThis.ResizeObserver
+      ? new ResizeObserver(updateHeight)
+      : undefined;
+    observer?.observe(root);
+    observer?.observe(composer);
+    globalThis.addEventListener?.("resize", updateHeight);
+    return () => {
+      observer?.disconnect();
+      globalThis.removeEventListener?.("resize", updateHeight);
+    };
+  }, [
+    matchingCommands.length,
+    placement,
+    snapshot.contextSelection.items.length,
+  ]);
+  useLayoutEffect(() => {
+    const listbox = commandsRef.current;
+    const option = listbox?.querySelector<HTMLElement>(
+      `#${commandsId}-${selectedCommandIndex}`,
+    );
+    if (!listbox || !option) return;
+    if (option.offsetTop < listbox.scrollTop) {
+      listbox.scrollTop = option.offsetTop;
+    } else if (
+      option.offsetTop + option.offsetHeight >
+      listbox.scrollTop + listbox.clientHeight
+    ) {
+      listbox.scrollTop =
+        option.offsetTop + option.offsetHeight - listbox.clientHeight;
+    }
+  }, [commandsId, matchingCommands.length, selectedCommandIndex]);
   return (
     <footer
       className="paui-composer-wrap"
@@ -1680,6 +1730,7 @@ export function ChatComposer() {
     >
       {matchingCommands.length ? (
         <div
+          ref={commandsRef}
           className="paui-commands"
           role="listbox"
           id={commandsId}
@@ -1701,7 +1752,11 @@ export function ChatComposer() {
           ))}
         </div>
       ) : null}
-      <div className="paui-composer" data-pretty-aui-slot="composer-input">
+      <div
+        ref={composerCardRef}
+        className="paui-composer"
+        data-pretty-aui-slot="composer-input"
+      >
         {snapshot.contextSelection.items.length ||
         snapshot.contextSelection.canAdd ? (
           <div
@@ -1831,11 +1886,12 @@ function ConfigBar({
   controller: ChatController;
   options: ChatSnapshot["configOptions"];
 }) {
-  const { runAction } = useChatContext("ChatComposer");
+  const { labels, runAction } = useChatContext("ChatComposer");
   return (
     <div className="paui-config">
-      {options.map((option) =>
-        option.type === "boolean" ? (
+      {options.map((option) => {
+        const label = configOptionLabel(option, labels);
+        return option.type === "boolean" ? (
           <label key={option.id} title={option.description}>
             <input
               type="checkbox"
@@ -1846,25 +1902,28 @@ function ConfigBar({
                 )
               }
             />
-            <span>{option.name}</span>
+            <span>{label}</span>
           </label>
         ) : option.type === "select" ? (
           <ConfigSelect
             controller={controller}
+            label={label}
             option={option}
             key={option.id}
           />
-        ) : null,
-      )}
+        ) : null;
+      })}
     </div>
   );
 }
 
 function ConfigSelect({
   controller,
+  label,
   option,
 }: {
   controller: ChatController;
+  label: string;
   option: ChatConfigOption;
 }) {
   const { runAction } = useChatContext("ChatComposer");
@@ -1966,7 +2025,7 @@ function ConfigSelect({
         className="paui-config__trigger"
         type="button"
         role="combobox"
-        aria-label={option.name}
+        aria-label={label}
         aria-controls={open ? listboxId : undefined}
         aria-expanded={open}
         aria-haspopup="listbox"
@@ -1987,7 +2046,7 @@ function ConfigSelect({
           className="paui-config__listbox"
           id={listboxId}
           role="listbox"
-          aria-label={option.name}
+          aria-label={label}
         >
           {choices.map((choice, index) => (
             <button
@@ -2018,6 +2077,15 @@ function ConfigSelect({
       ) : null}
     </div>
   );
+}
+
+function configOptionLabel(
+  option: ChatConfigOption,
+  labels: ChatLabels,
+): string {
+  return option.category === "mode" || option.id === "mode"
+    ? labels.mode
+    : option.name;
 }
 
 function PermissionCard({
@@ -2728,6 +2796,10 @@ markdownRenderer.html = ({ text }) => escapeHtml(text);
 markdownRenderer.image = ({ text }) =>
   `<span class="paui-markdown-image-alt">${escapeHtml(text)}</span>`;
 markdownRenderer.checkbox = ({ checked }) => (checked ? "[x] " : "[ ] ");
+markdownRenderer.table = function (token) {
+  const table = Renderer.prototype.table.call(this, token);
+  return `<div class="paui-markdown-table">${table}</div>`;
+};
 markdownRenderer.link = ({ href, title, tokens }) => {
   const content = escapeHtml(tokens.map((token) => token.raw).join(""));
   if (!safeUrl(href)) return content;

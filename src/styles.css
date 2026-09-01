@@ -565,6 +565,58 @@
   white-space: pre;
 }
 
+.paui-markdown-table {
+  box-sizing: border-box;
+  max-width: 100%;
+  overflow-x: auto;
+  margin: 0.72em 0;
+  border: 1px solid var(--paui-border);
+  border-radius: 9px;
+  scrollbar-color: var(--paui-border) transparent;
+}
+
+.paui-markdown-table table {
+  width: max-content;
+  min-width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9em;
+  line-height: 1.5;
+}
+
+.paui-markdown-table :is(th, td) {
+  min-width: 8rem;
+  padding: 8px 10px;
+  border-right: 1px solid var(--paui-border);
+  border-bottom: 1px solid var(--paui-border);
+  overflow-wrap: normal;
+  vertical-align: top;
+}
+
+.paui-markdown-table th {
+  background: var(--paui-surface);
+  font-weight: 650;
+}
+
+.paui-markdown-table [align="left"] {
+  text-align: left;
+}
+
+.paui-markdown-table [align="center"] {
+  text-align: center;
+}
+
+.paui-markdown-table [align="right"] {
+  text-align: right;
+}
+
+.paui-markdown-table tr:last-child td {
+  border-bottom: 0;
+}
+
+.paui-markdown-table :is(th, td):last-child {
+  border-right: 0;
+}
+
 .paui-markdown a,
 .paui-resource {
   color: var(--paui-accent);
@@ -1258,6 +1310,7 @@
 }
 
 .paui-composer-wrap {
+  position: relative;
   z-index: 3;
   display: grid;
   width: 100%;
@@ -1607,12 +1660,15 @@
 .paui-commands {
   position: absolute;
   right: var(--paui-gutter);
-  bottom: 76px;
+  bottom: calc(100% - 30px);
   left: var(--paui-gutter);
   display: grid;
   max-width: var(--paui-composer-width);
+  max-height: 320px;
   margin: 0 auto;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   border: 1px solid var(--paui-border);
   border-radius: 12px;
   background: var(--paui-surface-raised);
@@ -1630,8 +1686,13 @@
   text-align: left;
 }
 
-.paui-commands button:hover {
+.paui-commands button:hover,
+.paui-commands button[aria-selected="true"] {
   background: var(--paui-surface);
+}
+
+.paui-commands button:last-child {
+  border-bottom: 0;
 }
 
 .paui-commands code {

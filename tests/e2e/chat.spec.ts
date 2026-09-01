@@ -243,6 +243,36 @@ test("renders structured tool cards without root overflow", async ({
   ).toBeLessThanOrEqual(0);
 });
 
+test("scrolls wide Markdown tables inside the transcript without root overflow", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/?scheme=dark");
+  const composer = page.getByLabel("Ask anything…");
+  await expect(composer).toBeEnabled();
+  await composer.fill("show markdown table");
+  await composer.press("Enter");
+
+  const tableRegion = page.locator(".paui-markdown-table");
+  await expect(tableRegion.getByRole("table")).toBeVisible();
+  const geometry = await tableRegion.evaluate((region) => ({
+    regionOverflow: region.scrollWidth - region.clientWidth,
+    rootOverflow:
+      document.querySelector<HTMLElement>('[data-pretty-aui-slot="root"]')!
+        .scrollWidth -
+      document.querySelector<HTMLElement>('[data-pretty-aui-slot="root"]')!
+        .clientWidth,
+  }));
+  expect(geometry.regionOverflow).toBeGreaterThan(0);
+  expect(geometry.rootOverflow).toBeLessThanOrEqual(0);
+  await expect(
+    tableRegion.getByRole("columnheader", { name: "Status" }),
+  ).toHaveCSS("text-align", "center");
+  await expect(
+    tableRegion.getByRole("columnheader", { name: "Notes" }),
+  ).toHaveCSS("text-align", "right");
+});
+
 test("reveals message time only for hover or keyboard focus without narrow overflow", async ({
   page,
 }) => {
@@ -496,14 +526,35 @@ test("reselects a loaded demo session without replaying its history", async ({
 test("updates the header when the agent publishes a session title", async ({
   page,
 }) => {
-  await page.goto("/?scheme=light");
+  await page.goto("/?scheme=light&titleAfterPrompt=Published%20conversation");
+  const header = page.locator('[data-pretty-aui-slot="header"]');
+  await expect(
+    header.getByText("Conversation 1", { exact: true }),
+  ).toBeVisible();
+
+  const composer = page.getByLabel("Ask anything…");
+  await composer.fill("Publish the session title");
+  await composer.press("Enter");
+
+  await expect(
+    header.getByText("Published conversation", { exact: true }),
+  ).toBeVisible();
+  await expect(header.getByText("Conversation 1", { exact: true })).toHaveCount(
+    0,
+  );
+});
+
+test("updates the header from session-list when the agent omits title notifications", async ({
+  page,
+}) => {
+  await page.goto("/?scheme=light&titleSource=list");
   const header = page.locator('[data-pretty-aui-slot="header"]');
   await expect(
     header.getByText("Untitled session", { exact: true }),
   ).toBeVisible();
 
   const composer = page.getByLabel("Ask anything…");
-  await composer.fill("Publish the session title");
+  await composer.fill("Generate the session title");
   await composer.press("Enter");
 
   await expect(
@@ -552,6 +603,66 @@ test("matches the DSH primary send and stop control contract", async ({
   await expect(stop.locator("rect")).toHaveAttribute("height", "10");
   await expect(stop.locator("rect")).toHaveAttribute("rx", "3");
   await page.getByRole("button", { name: "Reject" }).click();
+});
+
+test("keeps every slash command reachable in a bounded scrolling list", async ({
+  page,
+}) => {
+  await page.goto("/?scheme=light&commands=many");
+  await page.evaluate(() => {
+    document
+      .querySelector<HTMLElement>('[data-pretty-aui-slot="root"]')!
+      .style.setProperty("--pretty-aui-height", "420px");
+  });
+  const composer = page.getByLabel("Ask anything…");
+  await composer.fill("load slash commands");
+  await composer.press("Enter");
+  await expect(page.getByText("Ready", { exact: true })).toBeVisible();
+
+  await composer.fill("/command");
+  const listbox = page.getByRole("listbox", { name: "Commands" });
+  await expect(listbox.getByRole("option")).toHaveCount(12);
+  const geometry = await listbox.evaluate((element) => {
+    const root = document.querySelector<HTMLElement>(
+      '[data-pretty-aui-slot="root"]',
+    )!;
+    const composerCard = document.querySelector<HTMLElement>(
+      '[data-pretty-aui-slot="composer-input"]',
+    )!;
+    const rootBox = root.getBoundingClientRect();
+    const listboxBox = element.getBoundingClientRect();
+    const composerBox = composerCard.getBoundingClientRect();
+    return {
+      rootOverflow: root.scrollWidth - root.clientWidth,
+      listTop: listboxBox.top,
+      listBottom: listboxBox.bottom,
+      rootTop: rootBox.top,
+      composerTop: composerBox.top,
+      clientHeight: element.clientHeight,
+      scrollHeight: element.scrollHeight,
+    };
+  });
+  expect(geometry.rootOverflow).toBeLessThanOrEqual(0);
+  expect(geometry.listTop).toBeGreaterThanOrEqual(geometry.rootTop);
+  expect(geometry.listBottom).toBeLessThanOrEqual(geometry.composerTop);
+  expect(geometry.scrollHeight).toBeGreaterThan(geometry.clientHeight);
+
+  await composer.press("Shift+Tab");
+  await expect(composer).not.toBeFocused();
+  await expect(composer).toHaveValue("/command");
+  await composer.focus();
+
+  for (let index = 1; index < 12; index += 1) {
+    await composer.press("ArrowDown");
+  }
+  const last = listbox.getByRole("option", { name: /command-12/ });
+  await expect(last).toHaveAttribute("aria-selected", "true");
+  expect(
+    await listbox.evaluate((element) => element.scrollTop),
+  ).toBeGreaterThan(0);
+  await composer.press("Tab");
+  await expect(composer).toHaveValue("/command-12 ");
+  await expect(listbox).toHaveCount(0);
 });
 
 test("follows the trailing line of a live DSH reasoning row", async ({

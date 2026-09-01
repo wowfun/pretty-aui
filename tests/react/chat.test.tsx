@@ -1014,6 +1014,35 @@ describe("Transcript", () => {
     expect(screen.getByText(/tracking pixel/)).toBeInTheDocument();
   });
 
+  it("renders GFM tables semantically inside a package-owned overflow region", () => {
+    const controller = new FakeChatController({
+      activities: [
+        message(
+          "assistant",
+          "| Name | Status | Count |\n| :--- | :---: | ---: |\n| Alpha | Ready | 3 |",
+        ),
+      ],
+    });
+    const { container } = render(<Chat controller={controller} />);
+
+    const region = container.querySelector(".paui-markdown-table");
+    expect(region).not.toBeNull();
+    const table = screen.getByRole("table");
+    expect(region).toContainElement(table);
+    expect(screen.getByRole("columnheader", { name: "Name" })).toHaveAttribute(
+      "align",
+      "left",
+    );
+    expect(
+      screen.getByRole("columnheader", { name: "Status" }),
+    ).toHaveAttribute("align", "center");
+    expect(screen.getByRole("columnheader", { name: "Count" })).toHaveAttribute(
+      "align",
+      "right",
+    );
+    expect(screen.getByRole("cell", { name: "Alpha" })).toBeVisible();
+  });
+
   it("does not reparse unchanged Markdown for unrelated snapshot updates", () => {
     const beforeSanitize = vi.fn();
     addHook("beforeSanitizeElements", beforeSanitize);
@@ -2330,6 +2359,29 @@ describe("Composer", () => {
     expect(controller.configChanges).toEqual([{ id: "model", value: "fast" }]);
   });
 
+  it("lets the host localize the normalized mode configuration label", () => {
+    const controller = new FakeChatController({
+      configOptions: [
+        {
+          id: "mode",
+          name: "Mode",
+          category: "mode",
+          type: "select",
+          currentValue: "plan",
+          options: [
+            { value: "plan", name: "Plan" },
+            { value: "build", name: "Build" },
+          ],
+        },
+      ],
+    });
+
+    render(<Chat controller={controller} labels={{ mode: "模式" }} />);
+
+    expect(screen.getByRole("combobox", { name: "模式" })).toBeVisible();
+    expect(screen.queryByRole("combobox", { name: "Mode" })).toBeNull();
+  });
+
   it("keeps focus on package-owned configuration listboxes", () => {
     const controller = new FakeChatController({
       configOptions: [
@@ -2381,13 +2433,43 @@ describe("Composer", () => {
     expect(options[0]).toHaveAttribute("aria-selected", "true");
     fireEvent.keyDown(composer, { key: "ArrowDown" });
     expect(options[1]).toHaveAttribute("aria-selected", "true");
-    fireEvent.keyDown(composer, { key: "Enter" });
+
+    const reverseTab = new KeyboardEvent("keydown", {
+      key: "Tab",
+      shiftKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    fireEvent(composer, reverseTab);
+    expect(reverseTab.defaultPrevented).toBe(false);
+    expect(composer).toHaveValue("/r");
+    expect(screen.getByRole("listbox", { name: "Commands" })).toBeVisible();
+
+    fireEvent.keyDown(composer, { key: "Tab" });
     expect(composer).toHaveValue("/rename ");
     expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
 
     fireEvent.input(composer, { target: { value: "/r" } });
     fireEvent.keyDown(composer, { key: "Escape" });
     expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
+  });
+
+  it("keeps every matching slash command available in the listbox", () => {
+    const controller = new FakeChatController({
+      commands: Array.from({ length: 12 }, (_, index) => ({
+        name: `command-${String(index + 1).padStart(2, "0")}`,
+        description: `Run command ${index + 1}`,
+      })),
+    });
+    render(<Chat controller={controller} />);
+    const composer = screen.getByLabelText("Ask anything…");
+
+    fireEvent.input(composer, { target: { value: "/command" } });
+
+    expect(screen.getAllByRole("option")).toHaveLength(12);
+    expect(
+      screen.getByRole("option", { name: /command-12/ }),
+    ).toBeInTheDocument();
   });
 
   it("submits slash-command arguments instead of replacing them", () => {

@@ -37,6 +37,7 @@ export interface ChatLabels {
   readonly historyGap: string;
   readonly historyGapTitle: string;
   readonly loadMore: string;
+  readonly mode: string;
   readonly newChat: string;
   readonly noSessions: string;
   readonly openLink: string;
@@ -109,6 +110,7 @@ export const defaultLabels: ChatLabels = {
   historyGap: "Earlier messages are unavailable for this session.",
   historyGapTitle: "Partial history",
   loadMore: "Load more",
+  mode: "Mode",
   newChat: "New chat",
   noSessions: "No previous sessions",
   openLink: "Open link",

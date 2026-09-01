@@ -25,6 +25,20 @@ const harness = liveUrl
       ...(query.get("usage") === "extreme"
         ? { usage: { used: Number.MAX_VALUE, size: Number.MAX_VALUE } }
         : {}),
+      ...(query.get("titleSource") === "list"
+        ? { listOnlySessionTitles: true }
+        : {}),
+      ...(query.get("titleAfterPrompt")
+        ? { titleAfterPrompt: query.get("titleAfterPrompt")! }
+        : {}),
+      ...(query.get("commands") === "many"
+        ? {
+            availableCommands: Array.from({ length: 12 }, (_, index) => ({
+              name: `command-${String(index + 1).padStart(2, "0")}`,
+              description: `Run fixture command ${index + 1}`,
+            })),
+          }
+        : {}),
     });
 const contextProvider = createDemoContextProvider();
 const controller = createChat({

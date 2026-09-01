@@ -1,5 +1,6 @@
 import { createChat } from "../../src/core/index.js";
 import type {
+  ChatEvent,
   ContextItem,
   ContextProvider,
   ContextRequest,
@@ -302,6 +303,163 @@ describe("ChatController protocol interface", () => {
         { sessionId: firstSessionId, id: "model", value: "fast" },
         { sessionId: secondSessionId, id: "model", value: "fast" },
       ]);
+    } finally {
+      await controller.destroy();
+      await harness.close();
+    }
+  });
+
+  it("applies a fixed mode to every legacy ACP v1 new session", async () => {
+    const harness = createV1Harness({ modeOnlySessionOrdinals: [1, 2] });
+    const controller = createChat({
+      connector: harness.connector,
+      protocol: 1,
+      session: { cwd: "/workspace" },
+      newSessionMode: "plan",
+    });
+    try {
+      await controller.ready;
+      const firstSessionId = controller.getSnapshot().sessionId!;
+      expect(controller.getSnapshot().configOptions).toEqual([
+        expect.objectContaining({ id: "mode", currentValue: "plan" }),
+      ]);
+
+      await controller.setConfigOption("mode", "fast");
+      await controller.newSession();
+      const secondSessionId = controller.getSnapshot().sessionId!;
+
+      expect(controller.getSnapshot().configOptions).toEqual([
+        expect.objectContaining({ id: "mode", currentValue: "plan" }),
+      ]);
+      expect(harness.modeUpdates).toEqual([
+        { sessionId: firstSessionId, value: "plan" },
+        { sessionId: firstSessionId, value: "fast" },
+        { sessionId: secondSessionId, value: "plan" },
+      ]);
+    } finally {
+      await controller.destroy();
+      await harness.close();
+    }
+  });
+
+  it("applies a categorized mode through the ACP v2 driver", async () => {
+    const harness = createV2Harness(0, {
+      modeConfig: true,
+      modeConfigId: "workflow",
+    });
+    const controller = createChat({
+      connector: harness.connector,
+      protocol: 2,
+      session: { cwd: "/workspace" },
+      newSessionMode: "plan",
+    });
+    try {
+      await controller.ready;
+      const firstSessionId = controller.getSnapshot().sessionId!;
+      await controller.newSession();
+      const secondSessionId = controller.getSnapshot().sessionId!;
+
+      expect(controller.getSnapshot().configOptions).toEqual([
+        expect.objectContaining({
+          id: "workflow",
+          category: "mode",
+          currentValue: "plan",
+        }),
+      ]);
+      expect(harness.configUpdates).toEqual([
+        { sessionId: firstSessionId, id: "workflow", value: "plan" },
+        { sessionId: secondSessionId, id: "workflow", value: "plan" },
+      ]);
+    } finally {
+      await controller.destroy();
+      await harness.close();
+    }
+  });
+
+  it("applies a fixed mode before the preferred model", async () => {
+    const harness = createV2Harness(0, {
+      modeConfig: true,
+      modeConfigId: "workflow",
+      modelConfig: true,
+      modelConfigId: "provider",
+    });
+    const controller = createChat({
+      connector: harness.connector,
+      protocol: 2,
+      session: { cwd: "/workspace" },
+      newSessionMode: "plan",
+      modelPreference: { get: () => "fast", set: () => undefined },
+    });
+    try {
+      await controller.ready;
+      const sessionId = controller.getSnapshot().sessionId!;
+
+      expect(controller.getSnapshot().configOptions).toEqual([
+        expect.objectContaining({
+          id: "workflow",
+          category: "mode",
+          currentValue: "plan",
+        }),
+        expect.objectContaining({
+          id: "provider",
+          category: "model",
+          currentValue: "fast",
+        }),
+      ]);
+      expect(harness.configUpdates).toEqual([
+        { sessionId, id: "workflow", value: "plan" },
+        { sessionId, id: "provider", value: "fast" },
+      ]);
+    } finally {
+      await controller.destroy();
+      await harness.close();
+    }
+  });
+
+  it("does not apply a new-session mode to an opened session", async () => {
+    const harness = createV1Harness();
+    const controller = createChat({
+      connector: harness.connector,
+      protocol: 1,
+      session: { cwd: "/workspace" },
+      initialSession: { type: "open", sessionId: "existing-session" },
+      newSessionMode: "plan",
+    });
+    try {
+      await controller.ready;
+      expect(controller.getSnapshot().sessionId).toBe("existing-session");
+      expect(harness.modeUpdates).toEqual([]);
+      expect(harness.configUpdates).toEqual([]);
+    } finally {
+      await controller.destroy();
+      await harness.close();
+    }
+  });
+
+  it("keeps a new session usable when its fixed mode is rejected", async () => {
+    const harness = createV1Harness({
+      modeOnlySessionOrdinals: [1],
+      configOptionFailure: true,
+    });
+    const diagnostics: string[] = [];
+    const controller = createChat({
+      connector: harness.connector,
+      protocol: 1,
+      session: { cwd: "/workspace" },
+      newSessionMode: "plan",
+      onEvent: (event) => {
+        if (event.type === "diagnostic") diagnostics.push(event.code);
+      },
+    });
+    try {
+      await controller.ready;
+      expect(controller.getSnapshot()).toMatchObject({
+        phase: "idle",
+        configOptions: [
+          expect.objectContaining({ id: "mode", currentValue: "balanced" }),
+        ],
+      });
+      expect(diagnostics).toContain("NEW_SESSION_MODE_APPLY_FAILED");
     } finally {
       await controller.destroy();
       await harness.close();
@@ -755,6 +913,7 @@ describe("ChatController protocol interface", () => {
     });
     try {
       await controller.ready;
+      await controller.listSessions();
       const before = controller.getSnapshot();
 
       await expect(controller.closeSession()).rejects.toThrow(
@@ -809,6 +968,233 @@ describe("ChatController protocol interface", () => {
         await controller.destroy();
         await harness.close();
       }
+    }
+  });
+
+  it("refreshes a completed turn title from session-list when notifications are absent", async () => {
+    const harness = createV1Harness({ listOnlySessionTitles: true });
+    const controller = createChat({
+      connector: harness.connector,
+      protocol: 1,
+      session: { cwd: "/workspace" },
+    });
+    try {
+      await controller.ready;
+      expect(controller.getSnapshot().sessionTitle).toBeUndefined();
+
+      await controller.send("Generate a catalog title").done;
+
+      await waitFor(
+        () => controller.getSnapshot().sessionTitle === "Conversation 1",
+      );
+      expect(harness.listSessionCursors).toContain(undefined);
+    } finally {
+      await controller.destroy();
+      await harness.close();
+    }
+  });
+
+  it("keeps notified title state authoritative over later catalog values", async () => {
+    const harness = createV1Harness();
+    const controller = createChat({
+      connector: harness.connector,
+      protocol: 1,
+      session: { cwd: "/workspace" },
+    });
+    try {
+      await controller.ready;
+      const sessionId = controller.getSnapshot().sessionId!;
+      const sink = controller as unknown as {
+        onUpdate(sessionId: string, update: unknown): void;
+      };
+      sink.onUpdate(sessionId, {
+        sessionUpdate: "session_info_update",
+        title: "Live title",
+      });
+
+      await controller.listSessions();
+      expect(controller.getSnapshot().sessionTitle).toBe("Live title");
+
+      sink.onUpdate(sessionId, {
+        sessionUpdate: "session_info_update",
+        title: null,
+      });
+      await controller.listSessions();
+      expect(controller.getSnapshot().sessionTitle).toBeUndefined();
+    } finally {
+      await controller.destroy();
+      await harness.close();
+    }
+  });
+
+  it("does not clear a catalog title when a later listing omits it", async () => {
+    const harness = createV1Harness({
+      omitSessionTitleOnListOrdinals: [2],
+    });
+    const controller = createChat({
+      connector: harness.connector,
+      protocol: 1,
+      session: { cwd: "/workspace" },
+    });
+    try {
+      await controller.ready;
+      await waitFor(
+        () => controller.getSnapshot().sessionTitle === "Conversation 1",
+      );
+
+      await controller.listSessions();
+
+      expect(controller.getSnapshot().sessionTitle).toBe("Conversation 1");
+    } finally {
+      await controller.destroy();
+      await harness.close();
+    }
+  });
+
+  it("does not refresh an already catalog-titled session when it is reselected", async () => {
+    const harness = createV1Harness();
+    const controller = createChat({
+      connector: harness.connector,
+      protocol: 1,
+      session: { cwd: "/workspace" },
+    });
+    try {
+      await controller.ready;
+      const sessionId = controller.getSnapshot().sessionId!;
+      await waitFor(
+        () => controller.getSnapshot().sessionTitle === "Conversation 1",
+      );
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(harness.listSessionCursors).toEqual([undefined]);
+
+      await controller.openSession(sessionId);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(harness.listSessionCursors).toEqual([undefined]);
+    } finally {
+      await controller.destroy();
+      await harness.close();
+    }
+  });
+
+  it("keeps a completed turn successful when automatic title refresh fails", async () => {
+    const events: ChatEvent[] = [];
+    const harness = createV1Harness({
+      listOnlySessionTitles: true,
+      beforeListSessions: (ordinal) =>
+        ordinal === 2
+          ? Promise.reject(new Error("Fixture session list failed"))
+          : Promise.resolve(),
+    });
+    const controller = createChat({
+      connector: harness.connector,
+      protocol: 1,
+      session: { cwd: "/workspace" },
+      onEvent: (event) => events.push(event),
+    });
+    try {
+      await controller.ready;
+      await waitFor(() => harness.listSessionCursors.length === 1);
+
+      await expect(
+        controller.send("Keep the turn successful").done,
+      ).resolves.toEqual({ stopReason: "end_turn" });
+      await waitFor(() =>
+        events.some(
+          (event) =>
+            event.type === "diagnostic" &&
+            event.code === "SESSION_TITLE_REFRESH_FAILED",
+        ),
+      );
+
+      expect(controller.getSnapshot()).toMatchObject({
+        phase: "idle",
+        stopReason: "end_turn",
+      });
+      expect(controller.getSnapshot().error).toBeUndefined();
+    } finally {
+      await controller.destroy();
+      await harness.close();
+    }
+  });
+
+  it("does not attribute a coalesced catalog refresh failure to one session", async () => {
+    const gate = deferred<void>();
+    const events: ChatEvent[] = [];
+    const harness = createV1Harness({
+      listOnlySessionTitles: true,
+      beforeListSessions: (ordinal) =>
+        ordinal === 1 ? gate.promise : Promise.resolve(),
+    });
+    const controller = createChat({
+      connector: harness.connector,
+      protocol: 1,
+      session: { cwd: "/workspace" },
+      onEvent: (event) => events.push(event),
+    });
+    try {
+      await controller.ready;
+      const firstSessionId = controller.getSnapshot().sessionId;
+      await waitFor(() => harness.listSessionCursors.length === 1);
+
+      await controller.newSession();
+      expect(controller.getSnapshot().sessionId).not.toBe(firstSessionId);
+      gate.reject(new Error("Fixture session list failed"));
+
+      await waitFor(() =>
+        events.some(
+          (event) =>
+            event.type === "diagnostic" &&
+            event.code === "SESSION_TITLE_REFRESH_FAILED",
+        ),
+      );
+      const diagnostic = events.find(
+        (event) =>
+          event.type === "diagnostic" &&
+          event.code === "SESSION_TITLE_REFRESH_FAILED",
+      );
+      expect(diagnostic).not.toHaveProperty("sessionId");
+    } finally {
+      gate.resolve();
+      await controller.destroy();
+      await harness.close();
+    }
+  });
+
+  it("runs an automatic first-page title refresh after active pagination", async () => {
+    const gate = deferred<void>();
+    const harness = createV1Harness({
+      listOnlySessionTitles: true,
+      paginatedSessions: true,
+      beforeListSessions: (ordinal) =>
+        ordinal === 2 ? gate.promise : Promise.resolve(),
+    });
+    const controller = createChat({
+      connector: harness.connector,
+      protocol: 1,
+      session: { cwd: "/workspace" },
+    });
+    try {
+      await controller.ready;
+      await waitFor(() => harness.listSessionCursors.length === 1);
+      const pageTwo = controller.listSessions("page-2");
+      await waitFor(() => harness.listSessionCursors.length === 2);
+
+      await controller.send("Refresh after pagination").done;
+      expect(harness.listSessionCursors).toEqual([undefined, "page-2"]);
+
+      gate.resolve();
+      await pageTwo;
+      await waitFor(() => harness.listSessionCursors.length === 3);
+      expect(harness.listSessionCursors).toEqual([
+        undefined,
+        "page-2",
+        undefined,
+      ]);
+    } finally {
+      gate.resolve();
+      await controller.destroy();
+      await harness.close();
     }
   });
 
@@ -2186,6 +2572,41 @@ describe("ChatController protocol interface", () => {
           .getSnapshot()
           .activities.filter((activity) => activity.type === "context"),
       ).toHaveLength(0);
+    } finally {
+      await controller.destroy();
+      await harness.close();
+    }
+  });
+
+  it("preserves a bounded context provider reason in the user-facing failure", async () => {
+    const harness = createV1Harness();
+    const controller = createChat({
+      connector: harness.connector,
+      session: { cwd: "/workspace" },
+      context: testContextProvider(
+        [{ id: "page", label: "Current page" }],
+        () => {
+          throw new Error(
+            "ACP context budget is too small to preserve all selected identities " +
+              "x".repeat(2_000),
+          );
+        },
+      ),
+    });
+    try {
+      await controller.ready;
+      const failure = await controller
+        .send("Inspect")
+        .done.catch((error) => error);
+      expect(failure).toMatchObject({
+        code: "CONTEXT_FAILED",
+        message: expect.stringContaining(
+          "ACP context budget is too small to preserve all selected identities",
+        ),
+      });
+      expect(failure.message.length).toBeLessThan(1_200);
+      expect(failure.message).toMatch(/…$/);
+      expect(harness.prompts).toHaveLength(0);
     } finally {
       await controller.destroy();
       await harness.close();

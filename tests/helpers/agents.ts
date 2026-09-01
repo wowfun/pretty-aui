@@ -75,10 +75,19 @@ export interface FakeAgentHarnessOptions {
   readonly configOptionFailure?: boolean | undefined;
   readonly logoutFailure?: boolean | undefined;
   readonly paginatedSessions?: boolean | undefined;
+  readonly listOnlySessionTitles?: boolean | undefined;
+  readonly omitSessionTitleOnListOrdinals?: readonly number[] | undefined;
+  readonly titleAfterPrompt?: string | undefined;
+  readonly availableCommands?: readonly {
+    readonly name: string;
+    readonly description: string;
+  }[];
   readonly modeOnlySessionOrdinals?: readonly number[] | undefined;
   readonly loadedModel?: string | undefined;
   readonly modelConfig?: boolean | undefined;
   readonly modelConfigId?: string | undefined;
+  readonly modeConfig?: boolean | undefined;
+  readonly modeConfigId?: string | undefined;
   readonly v2ReplayUserContent?: readonly ContentBlock[] | undefined;
   readonly usage?: { readonly used: number; readonly size: number } | undefined;
 }
@@ -100,7 +109,7 @@ export function createV1Harness(
     string,
     {
       cwd: string;
-      title: string;
+      title: string | undefined;
       prompts: ContentBlock[][];
       replayText?: string | undefined;
     }
@@ -152,7 +161,9 @@ export function createV1Harness(
       const sessionId = `v1-session-${++sessionCounter}`;
       sessions.set(sessionId, {
         cwd: params.cwd,
-        title: `Conversation ${sessionCounter}`,
+        title: options.listOnlySessionTitles
+          ? undefined
+          : `Conversation ${sessionCounter}`,
         prompts: [],
       });
       standaloneElicitation = () =>
@@ -172,6 +183,7 @@ export function createV1Harness(
               modes: {
                 currentModeId: "balanced",
                 availableModes: [
+                  { id: "plan", name: "Plan" },
                   { id: "fast", name: "Fast" },
                   { id: "balanced", name: "Balanced" },
                 ],
@@ -232,7 +244,12 @@ export function createV1Harness(
           .map(([sessionId, session]) => ({
             sessionId,
             cwd: session.cwd,
-            title: session.title,
+            ...(session.title &&
+            !options.omitSessionTitleOnListOrdinals?.includes(
+              listSessionCursors.length,
+            )
+              ? { title: session.title }
+              : {}),
             updatedAt: "2026-08-24T12:00:00Z",
           })),
       };
@@ -241,7 +258,7 @@ export function createV1Harness(
       loadSessionRequests += 1;
       await options.beforeLoadSession?.(params.sessionId);
       const stored = sessions.get(params.sessionId);
-      if (stored) {
+      if (stored?.title && !options.listOnlySessionTitles) {
         await client.notify(v1.methods.client.session.update, {
           sessionId: params.sessionId,
           update: {
@@ -348,6 +365,9 @@ export function createV1Harness(
       sessions.delete(params.sessionId);
     })
     .onRequest(v1.methods.agent.session.setMode, ({ params }) => {
+      if (options.configOptionFailure) {
+        throw v1.RequestError.internalError(undefined, "Fixture mode failed");
+      }
       modeUpdates.push({ sessionId: params.sessionId, value: params.modeId });
       return {};
     })
@@ -388,6 +408,12 @@ export function createV1Harness(
       const session = sessions.get(params.sessionId);
       session?.prompts.push([...prompt]);
       if (session) {
+        session.title =
+          options.titleAfterPrompt ??
+          session.title ??
+          `Conversation ${params.sessionId.split("-").at(-1)}`;
+      }
+      if (session && !options.listOnlySessionTitles) {
         await client.notify(v1.methods.client.session.update, {
           sessionId: params.sessionId,
           update: {
@@ -431,7 +457,7 @@ export function createV1Harness(
         sessionId: params.sessionId,
         update: {
           sessionUpdate: "available_commands_update",
-          availableCommands: [
+          availableCommands: options.availableCommands ?? [
             {
               name: "review",
               description: "Review the current page",
@@ -665,7 +691,9 @@ export function createV1Harness(
             type: "text",
             text: text.includes("xss")
               ? "Safe <img src=x onerror=alert(1)> "
-              : "## Ready\n\n",
+              : text.includes("markdown table")
+                ? "| Name | Status | Notes |\n| :--- | :---: | ---: |\n"
+                : "## Ready\n\n",
           },
         },
       });
@@ -678,7 +706,9 @@ export function createV1Harness(
             type: "text",
             text: text.includes("xss")
               ? "**answer**"
-              : "The fixture agent completed the request.",
+              : text.includes("markdown table")
+                ? "| alpha-component-with-a-long-name | active | 1200 |\n| beta-component-with-a-long-name | queued | 34 |"
+                : "The fixture agent completed the request.",
           },
         },
       });
@@ -722,6 +752,9 @@ export function createV2Harness(
     | "paginatedSessions"
     | "modelConfig"
     | "modelConfigId"
+    | "modeConfig"
+    | "modeConfigId"
+    | "configOptionFailure"
     | "v2ReplayUserContent"
   > = {},
 ): FakeAgentHarness {
@@ -734,7 +767,46 @@ export function createV2Harness(
     value: string | boolean;
   }[] = [];
   const sessions = new Map<string, { cwd: v2.AbsolutePath }>();
+  const configValues = new Map<string, { mode: string; model: string }>();
   let sessionCounter = 0;
+  const sessionConfigOptions = (sessionId: string) => {
+    const values = configValues.get(sessionId) ?? {
+      mode: "build",
+      model: "balanced",
+    };
+    return [
+      ...(options.modeConfig
+        ? [
+            {
+              configId: options.modeConfigId ?? "mode",
+              name: "Mode",
+              category: "mode",
+              type: "select",
+              currentValue: values.mode,
+              options: [
+                { value: "plan", name: "Plan" },
+                { value: "build", name: "Build" },
+              ],
+            } as never,
+          ]
+        : []),
+      ...(options.modelConfig
+        ? [
+            {
+              configId: options.modelConfigId ?? "model",
+              name: "Model",
+              category: "model",
+              type: "select",
+              currentValue: values.model,
+              options: [
+                { value: "fast", name: "Fast" },
+                { value: "balanced", name: "Balanced" },
+              ],
+            } as never,
+          ]
+        : []),
+    ];
+  };
   const app = v2
     .agent({ name: "pretty-aui-test-v2" })
     .onRequest(v2.methods.agent.initialize, () => ({
@@ -753,24 +825,11 @@ export function createV2Harness(
     .onRequest(v2.methods.agent.session.new, ({ params }) => {
       const sessionId = `v2-session-${++sessionCounter}`;
       sessions.set(sessionId, { cwd: params.cwd });
+      configValues.set(sessionId, { mode: "build", model: "balanced" });
       return {
         sessionId,
-        ...(options.modelConfig
-          ? {
-              configOptions: [
-                {
-                  configId: options.modelConfigId ?? "model",
-                  name: "Model",
-                  category: "model",
-                  type: "select",
-                  currentValue: "balanced",
-                  options: [
-                    { value: "fast", name: "Fast" },
-                    { value: "balanced", name: "Balanced" },
-                  ],
-                },
-              ],
-            }
+        ...(options.modelConfig || options.modeConfig
+          ? { configOptions: sessionConfigOptions(sessionId) }
           : {}),
       };
     })
@@ -825,6 +884,12 @@ export function createV2Harness(
       sessions.delete(params.sessionId);
     })
     .onRequest(v2.methods.agent.session.setConfigOption, ({ params }) => {
+      if (options.configOptionFailure) {
+        throw v2.RequestError.internalError(
+          undefined,
+          "Fixture config option failed",
+        );
+      }
       if (
         typeof params.value !== "string" &&
         typeof params.value !== "boolean"
@@ -836,20 +901,17 @@ export function createV2Harness(
         id: params.configId,
         value: params.value,
       });
+      const values = configValues.get(params.sessionId);
+      if (values && typeof params.value === "string") {
+        if (params.configId === (options.modeConfigId ?? "mode")) {
+          values.mode = params.value;
+        }
+        if (params.configId === (options.modelConfigId ?? "model")) {
+          values.model = params.value;
+        }
+      }
       return {
-        configOptions: [
-          {
-            configId: params.configId,
-            name: "Model",
-            category: "model",
-            type: params.type,
-            currentValue: params.value,
-            options: [
-              { value: "fast", name: "Fast" },
-              { value: "balanced", name: "Balanced" },
-            ],
-          } as never,
-        ],
+        configOptions: sessionConfigOptions(params.sessionId),
       };
     })
     .onRequest(v2.methods.agent.session.prompt, async ({ params, client }) => {

@@ -250,6 +250,8 @@ export interface ChatOptions {
   readonly initialSession?: InitialSession;
   /** Best-effort host persistence for the model inherited by new sessions. */
   readonly modelPreference?: ModelPreferenceStore;
+  /** Agent-advertised mode applied to every genuinely new session. */
+  readonly newSessionMode?: string;
   /** Fixed or per-turn context resolved before each prompt is sent. */
   readonly context?: readonly ContextItem[] | ContextProvider;
   /** Whether agent-advertised browser authentication may be used. */
@@ -475,7 +477,10 @@ export interface ChatSnapshot {
    * of the same logical session.
    */
   readonly sessionInstanceId?: string;
-  /** Agent-owned session title displayed by the header and updated in place. */
+  /**
+   * Agent-owned title displayed by the header. Session notifications are
+   * authoritative; session-list catalogs provide a fallback when absent.
+   */
   readonly sessionTitle?: string;
   /** Ancestors captured while entering child sessions from Agent activities. */
   readonly sessionTrail: readonly SessionInfo[];

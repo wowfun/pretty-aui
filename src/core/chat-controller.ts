@@ -54,6 +54,7 @@ const NO_CAPABILITIES: ChatCapabilities = {
 };
 const MAX_MODEL_PREFERENCE_LENGTH = 16 * 1024;
 const MAX_NOTICE_LENGTH = 16 * 1024;
+const MAX_CONTEXT_FAILURE_DETAIL_LENGTH = 1_024;
 
 interface PendingInteraction<Decision> {
   readonly sessionId?: string;
@@ -80,6 +81,7 @@ interface ManagedSession {
   commands: ChatSnapshot["commands"];
   interactions: ChatSnapshot["interactions"];
   sessionTitle: string | undefined;
+  sessionTitleSource: "catalog" | "notification" | undefined;
   historyGap: boolean;
   usage: ChatSnapshot["usage"];
   stopReason: string | undefined;
@@ -93,6 +95,7 @@ interface StagingSession {
   configOptions: ChatSnapshot["configOptions"];
   commands: ChatSnapshot["commands"];
   sessionTitle: string | undefined;
+  sessionTitleSource: "catalog" | "notification" | undefined;
 }
 
 /**
@@ -139,6 +142,7 @@ class DefaultChatController implements ChatController, ProtocolSink {
   #connectionError: ChatSnapshot["error"];
   #sessionTrail: ChatSnapshot["sessionTrail"] = [];
   #modelPreference: string | undefined;
+  readonly #newSessionMode: string | undefined;
   #newSessionMutation: symbol | undefined;
   readonly #sessionMutations = new Map<string, symbol>();
   #sessionListRequest:
@@ -148,10 +152,13 @@ class DefaultChatController implements ChatController, ProtocolSink {
         readonly token: symbol;
       }
     | undefined;
+  #sessionTitleRefresh: Promise<void> | undefined;
+  #sessionTitleRefreshRequested = false;
 
   constructor(options: ChatOptions) {
     this.#options = options;
     this.#modelPreference = this.#readModelPreference();
+    this.#newSessionMode = this.#readNewSessionMode();
     this.#contextSelection = readContextSelection(options.context);
     this.#snapshot = {
       phase: "connecting",
@@ -410,6 +417,7 @@ class DefaultChatController implements ChatController, ProtocolSink {
                 ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
               }
             : page;
+        this.#reconcileCatalogTitles(sessions.sessions);
         this.#snapshot = cleanSnapshot({ ...this.#snapshot, sessions });
         this.#publish();
         return sessions;
@@ -902,6 +910,7 @@ class DefaultChatController implements ChatController, ProtocolSink {
             configOptions: oldSession.configOptions,
             commands: oldSession.commands,
             sessionTitle: oldSession.sessionTitle,
+            sessionTitleSource: oldSession.sessionTitleSource,
           };
           this.#staging.set(oldSession.sessionId, staging);
           const restored = await driver.openSession(
@@ -1120,16 +1129,12 @@ class DefaultChatController implements ChatController, ProtocolSink {
       return canonical;
     } catch (error) {
       if (signal.aborted) throw signal.reason ?? error;
-      throw new PrettyAuiError(
-        "CONTEXT_FAILED",
-        "Context could not be prepared; the prompt was not sent",
-        {
-          cause: error,
-          protocol: this.#driver?.version,
-          phase: "context",
-          retryable: true,
-        },
-      );
+      throw new PrettyAuiError("CONTEXT_FAILED", contextFailureMessage(error), {
+        cause: error,
+        protocol: this.#driver?.version,
+        phase: "context",
+        retryable: true,
+      });
     }
   }
 
@@ -1145,6 +1150,7 @@ class DefaultChatController implements ChatController, ProtocolSink {
       configOptions: [],
       commands: [],
       sessionTitle: undefined,
+      sessionTitleSource: undefined,
     };
     this.#staging.set(sessionId, staging);
     try {
@@ -1168,8 +1174,9 @@ class DefaultChatController implements ChatController, ProtocolSink {
   }
 
   async #newSession(driver: ProtocolDriver): Promise<ProtocolSession> {
-    const session = await driver.newSession(this.#options.session);
+    let session = await driver.newSession(this.#options.session);
     this.#assertDriverCurrent(driver);
+    session = await this.#applyNewSessionMode(driver, session);
     const model = findModelOption(session.configOptions);
     const preferred = this.#modelPreference;
     if (
@@ -1187,16 +1194,7 @@ class DefaultChatController implements ChatController, ProtocolSink {
         preferred,
       );
       this.#assertDriverCurrent(driver);
-      return {
-        ...session,
-        configOptions: returned.length
-          ? returned
-          : session.configOptions.map((option) =>
-              option.id === model.id
-                ? { ...option, currentValue: preferred }
-                : option,
-            ),
-      };
+      return updateSessionConfigOption(session, model, preferred, returned);
     } catch (error) {
       this.#assertDriverCurrent(driver);
       if (this.#connectionPhase === "error") throw connectionClosedError();
@@ -1206,6 +1204,42 @@ class DefaultChatController implements ChatController, ProtocolSink {
         code: "MODEL_PREFERENCE_APPLY_FAILED",
         message:
           "The preferred model could not be applied; using the Agent default",
+      });
+      return session;
+    }
+  }
+
+  async #applyNewSessionMode(
+    driver: ProtocolDriver,
+    session: ProtocolSession,
+  ): Promise<ProtocolSession> {
+    const mode = findModeOption(session.configOptions);
+    const preferred = this.#newSessionMode;
+    if (
+      !mode ||
+      !preferred ||
+      mode.currentValue === preferred ||
+      !mode.options?.some((option) => option.value === preferred)
+    ) {
+      return session;
+    }
+    try {
+      const returned = await driver.setConfigOption(
+        session.sessionId,
+        mode.id,
+        preferred,
+      );
+      this.#assertDriverCurrent(driver);
+      return updateSessionConfigOption(session, mode, preferred, returned);
+    } catch (error) {
+      this.#assertDriverCurrent(driver);
+      if (this.#connectionPhase === "error") throw connectionClosedError();
+      this.#emit({
+        type: "diagnostic",
+        sessionId: session.sessionId,
+        code: "NEW_SESSION_MODE_APPLY_FAILED",
+        message:
+          "The fixed new-session mode could not be applied; using the Agent default",
       });
       return session;
     }
@@ -1243,6 +1277,7 @@ class DefaultChatController implements ChatController, ProtocolSink {
     if (effect.configOptions) session.configOptions = effect.configOptions;
     if (effect.sessionTitle !== undefined) {
       session.sessionTitle = effect.sessionTitle ?? undefined;
+      session.sessionTitleSource = "notification";
       summaryChanged = true;
     }
     if (effect.usage) session.usage = effect.usage;
@@ -1271,8 +1306,10 @@ class DefaultChatController implements ChatController, ProtocolSink {
   #applyStagingEffect(staging: StagingSession, effect: ReducerEffect): void {
     if (effect.commands) staging.commands = effect.commands;
     if (effect.configOptions) staging.configOptions = effect.configOptions;
-    if (effect.sessionTitle !== undefined)
+    if (effect.sessionTitle !== undefined) {
       staging.sessionTitle = effect.sessionTitle ?? undefined;
+      staging.sessionTitleSource = "notification";
+    }
     this.#emitTimelineDiagnostics(staging.sessionId, effect);
   }
 
@@ -1513,6 +1550,13 @@ class DefaultChatController implements ChatController, ProtocolSink {
     staging?: StagingSession,
     instanceId = `session-instance-${++this.#sessionInstanceCounter}`,
   ): ManagedSession {
+    const catalogTitle = this.#snapshot.sessions?.sessions.find(
+      (candidate) => candidate.sessionId === session.sessionId,
+    )?.title;
+    const notificationTitle = staging?.sessionTitleSource === "notification";
+    const sessionTitle = notificationTitle
+      ? staging?.sessionTitle
+      : (staging?.sessionTitle ?? catalogTitle);
     const managed: ManagedSession = {
       sessionId: session.sessionId,
       instanceId,
@@ -1524,7 +1568,12 @@ class DefaultChatController implements ChatController, ProtocolSink {
         : (staging?.configOptions ?? []),
       commands: staging?.commands ?? session.commands ?? [],
       interactions: [],
-      sessionTitle: staging?.sessionTitle,
+      sessionTitle,
+      sessionTitleSource: notificationTitle
+        ? "notification"
+        : sessionTitle !== undefined
+          ? "catalog"
+          : undefined,
       historyGap: session.historyGap ?? false,
       usage: undefined,
       stopReason: undefined,
@@ -1548,6 +1597,12 @@ class DefaultChatController implements ChatController, ProtocolSink {
     });
     this.#publish();
     this.#emit({ type: "session_changed", sessionId: session.sessionId });
+    if (
+      session.sessionTitle === undefined &&
+      session.sessionTitleSource !== "notification"
+    ) {
+      this.#queueSessionTitleRefresh();
+    }
   }
 
   #clearSelection(): void {
@@ -1609,6 +1664,18 @@ class DefaultChatController implements ChatController, ProtocolSink {
       type: "diagnostic",
       code: "INVALID_MODEL_PREFERENCE",
       message: "Ignored an invalid host model preference",
+    });
+    return undefined;
+  }
+
+  #readNewSessionMode(): string | undefined {
+    const value = this.#options.newSessionMode;
+    if (value === undefined) return undefined;
+    if (validConfigValue(value)) return value;
+    this.#emit({
+      type: "diagnostic",
+      code: "INVALID_NEW_SESSION_MODE",
+      message: "Ignored an invalid fixed new-session mode",
     });
     return undefined;
   }
@@ -1761,7 +1828,73 @@ class DefaultChatController implements ChatController, ProtocolSink {
       turnId: turn.id,
       stopReason,
     });
+    if (
+      stopReason !== "cancelled" &&
+      session.sessionTitleSource !== "notification"
+    ) {
+      this.#queueSessionTitleRefresh();
+    }
     return { stopReason };
+  }
+
+  #reconcileCatalogTitles(sessions: readonly SessionInfo[]): void {
+    for (const catalog of sessions) {
+      if (catalog.title === undefined) continue;
+      const loaded = this.#sessions.get(catalog.sessionId);
+      if (!loaded || loaded.sessionTitleSource === "notification") continue;
+      loaded.sessionTitle = catalog.title;
+      loaded.sessionTitleSource = "catalog";
+    }
+  }
+
+  #queueSessionTitleRefresh(): void {
+    if (
+      this.#destroyed ||
+      !this.#snapshot.capabilities.listSessions ||
+      !this.#driver
+    ) {
+      return;
+    }
+    this.#sessionTitleRefreshRequested = true;
+    if (this.#sessionTitleRefresh) return;
+    const driver = this.#driver;
+    const operation = Promise.resolve()
+      .then(async () => {
+        while (this.#sessionTitleRefreshRequested && !this.#destroyed) {
+          this.#sessionTitleRefreshRequested = false;
+          const active = this.#sessionListRequest;
+          let firstPageSatisfied = false;
+          if (active) {
+            try {
+              await active.operation;
+              firstPageSatisfied = active.cursor === undefined;
+            } catch {
+              // The best-effort refresh gets one independent first-page try.
+            }
+          }
+          if (this.#destroyed || this.#driver !== driver) return;
+          if (firstPageSatisfied) continue;
+          try {
+            await this.listSessions();
+          } catch {
+            if (this.#destroyed || this.#driver !== driver) return;
+            this.#emit({
+              type: "diagnostic",
+              code: "SESSION_TITLE_REFRESH_FAILED",
+              message:
+                "The session title could not be refreshed from the Agent catalog",
+            });
+          }
+        }
+      })
+      .finally(() => {
+        if (this.#sessionTitleRefresh !== operation) return;
+        this.#sessionTitleRefresh = undefined;
+        if (this.#sessionTitleRefreshRequested) {
+          this.#queueSessionTitleRefresh();
+        }
+      });
+    this.#sessionTitleRefresh = operation;
   }
 
   async #withNewSessionOperation<Value>(
@@ -2066,7 +2199,52 @@ function findModelOption(
   );
 }
 
+function contextFailureMessage(error: unknown): string {
+  const summary = "Context could not be prepared; the prompt was not sent";
+  if (!(error instanceof Error)) return summary;
+  const detail = error.message.trim();
+  if (!detail) return summary;
+  let bounded = detail.slice(0, MAX_CONTEXT_FAILURE_DETAIL_LENGTH);
+  const trailing = bounded.charCodeAt(bounded.length - 1);
+  if (trailing >= 0xd800 && trailing <= 0xdbff) bounded = bounded.slice(0, -1);
+  if (detail.length > MAX_CONTEXT_FAILURE_DETAIL_LENGTH) bounded += "…";
+  return `${summary}: ${bounded}`;
+}
+
+function findModeOption(
+  options: readonly ChatConfigOption[],
+): ChatConfigOption | undefined {
+  return (
+    options.find(
+      (option) => option.category === "mode" && option.type === "select",
+    ) ??
+    options.find((option) => option.id === "mode" && option.type === "select")
+  );
+}
+
+function updateSessionConfigOption(
+  session: ProtocolSession,
+  option: ChatConfigOption,
+  value: string,
+  returned: readonly ChatConfigOption[],
+): ProtocolSession {
+  return {
+    ...session,
+    configOptions: returned.length
+      ? returned
+      : session.configOptions.map((candidate) =>
+          candidate.id === option.id
+            ? { ...candidate, currentValue: value }
+            : candidate,
+        ),
+  };
+}
+
 function validModelPreference(value: unknown): value is string {
+  return validConfigValue(value);
+}
+
+function validConfigValue(value: unknown): value is string {
   return (
     typeof value === "string" &&
     value.length > 0 &&
